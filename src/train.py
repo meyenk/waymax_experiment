@@ -23,7 +23,7 @@ def build_examples_from_scenario(scenario, hist_len=10, future_len=30, stride=10
     return examples
 
 
-def run_epoch(model, optimizer, scenario_iter, max_scenarios, batch_size=16, train=True):
+def run_epoch(model, optimizer, scenario_iter, max_scenarios, batch_size=16, train=True, device="cpu"):
     """One pass over up to max_scenarios scenarios. Returns mean loss."""
     model.train() if train else model.eval()
     buffer, losses = [], []
@@ -32,6 +32,8 @@ def run_epoch(model, optimizer, scenario_iter, max_scenarios, batch_size=16, tra
         if not chunk:
             return None
         batch, target = collate_examples(chunk)
+        batch = {k: v.to(device) for k, v in batch.items()}
+        target = target.to(device)
         if train:
             optimizer.zero_grad()
             pred, _ = model(batch)
@@ -70,7 +72,7 @@ def plot_loss_curves(train_losses, val_losses):
     plt.show()
 
 
-def plot_bev_prediction(model, scenario, hist_len=10, future_len=30, t=None):
+def plot_bev_prediction(model, scenario, hist_len=10, future_len=30, t=None, device="cpu"):
     """One example: ego past, logged future, predicted future, nearby agents -- all
     already in the ego-centric frame at t, so this plots directly, no re-transform."""
     ego_idx = int(np.argmax(scenario.object_metadata.is_sdc))
@@ -84,10 +86,11 @@ def plot_bev_prediction(model, scenario, hist_len=10, future_len=30, t=None):
         return
 
     batch, target = collate_examples([ex])
+    batch = {k: v.to(device) for k, v in batch.items()}
     model.eval()
     with torch.no_grad():
         pred, weights = model(batch)
-    pred = pred[0].numpy()
+    pred = pred[0].cpu().numpy()
     target = target[0].numpy()
 
     fig, ax = plt.subplots(figsize=(6, 6))
