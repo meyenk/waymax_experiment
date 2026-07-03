@@ -33,10 +33,14 @@ class RelevancePool(nn.Module):
 
 class AgentBranch(nn.Module):
     """Per-agent GRU over history + static class embedding, then relevance pool.
-    cont_feat_dim=6: [x, y, cos_yaw, sin_yaw, vx_rel, vy_rel] (ego frame)."""
+    cont_feat_dim=6: [x, y, cos_yaw, sin_yaw, vx_rel, vy_rel] (ego frame).
+    num_classes=8 gives headroom above WOMD's known ~5 object types (including
+    "other") -- ids are also clamped defensively so an unexpected value never
+    crashes training, it just gets bucketed into the last slot."""
 
-    def __init__(self, cont_feat_dim=6, num_classes=4, class_embed_dim=8, hidden_dim=64):
+    def __init__(self, cont_feat_dim=6, num_classes=8, class_embed_dim=8, hidden_dim=64):
         super().__init__()
+        self.num_classes = num_classes
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
         self.gru = nn.GRU(cont_feat_dim, hidden_dim, batch_first=True)
         self.pool = RelevancePool(hidden_dim + class_embed_dim)
@@ -44,6 +48,7 @@ class AgentBranch(nn.Module):
 
     def forward(self, hist_feats, class_ids, mask):
         # hist_feats: (B, N, hist_len, cont_feat_dim), class_ids/mask: (B, N)
+        class_ids = class_ids.clamp(0, self.num_classes - 1)
         B, N, T, F = hist_feats.shape
         _, h_n = self.gru(hist_feats.view(B * N, T, F))
         h_n = h_n.squeeze(0).view(B, N, -1)
@@ -53,10 +58,12 @@ class AgentBranch(nn.Module):
 
 class MapBranch(nn.Module):
     """Static map points (lane markings, stop signs, crosswalks, ...) -> MLP -> pool.
-    No time dimension -- these don't move."""
+    No time dimension -- these don't move. num_types=32 gives headroom above
+    WOMD's roadgraph type enum (~20 known values); ids are clamped defensively."""
 
-    def __init__(self, cont_feat_dim=2, num_types=20, type_embed_dim=8, hidden_dim=64):
+    def __init__(self, cont_feat_dim=2, num_types=32, type_embed_dim=8, hidden_dim=64):
         super().__init__()
+        self.num_types = num_types
         self.type_embed = nn.Embedding(num_types, type_embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(cont_feat_dim + type_embed_dim, hidden_dim), nn.ReLU(),
@@ -67,16 +74,19 @@ class MapBranch(nn.Module):
 
     def forward(self, point_xy, type_ids, mask):
         # point_xy: (B, N, 2), type_ids/mask: (B, N)
+        type_ids = type_ids.clamp(0, self.num_types - 1)
         combined = torch.cat([point_xy, self.type_embed(type_ids)], dim=-1)
         return self.pool(self.mlp(combined), mask)
 
 
 class TrafficLightBranch(nn.Module):
     """Per-light GRU over (stop-line position, state) across history -> pool.
-    Has a time dimension -- light state changes."""
+    Has a time dimension -- light state changes. num_states=16 gives headroom
+    above WOMD's known 9 light states; ids are clamped defensively."""
 
-    def __init__(self, cont_feat_dim=2, num_states=8, state_embed_dim=8, hidden_dim=64):
+    def __init__(self, cont_feat_dim=2, num_states=16, state_embed_dim=8, hidden_dim=64):
         super().__init__()
+        self.num_states = num_states
         self.state_embed = nn.Embedding(num_states, state_embed_dim)
         self.gru = nn.GRU(cont_feat_dim + state_embed_dim, hidden_dim, batch_first=True)
         self.pool = RelevancePool(hidden_dim)
@@ -84,6 +94,7 @@ class TrafficLightBranch(nn.Module):
 
     def forward(self, hist_xy, state_ids, mask):
         # hist_xy: (B, N, hist_len, 2), state_ids: (B, N, hist_len), mask: (B, N)
+        state_ids = state_ids.clamp(0, self.num_states - 1)
         B, N, T, _ = hist_xy.shape
         combined = torch.cat([hist_xy, self.state_embed(state_ids)], dim=-1)
         _, h_n = self.gru(combined.view(B * N, T, -1))
