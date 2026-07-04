@@ -137,7 +137,10 @@ def extract_traffic_lights(scenario, ego_idx, t, hist_len=10):
 
 
 def extract_ego_target(scenario, ego_idx, t, future_len=30):
-    """Ego's own future, in its own frame at t. Returns (future_len, 2) offsets, or None."""
+    """Ego's own future, as ABSOLUTE positions in its own frame at t -- this must
+    match Stage1Model's output space, since the model cumsums its decoder's raw
+    per-step offsets internally before returning `pred`. Returns (future_len, 2)
+    absolute positions, or None."""
     traj = scenario.log_trajectory
     if t + future_len >= traj.x.shape[1] or not np.all(traj.valid[ego_idx, t:t + future_len + 1]):
         return None
@@ -145,8 +148,7 @@ def extract_ego_target(scenario, ego_idx, t, future_len=30):
     fut_raw = np.stack([traj.x[ego_idx, t + 1:t + future_len + 1],
                          traj.y[ego_idx, t + 1:t + future_len + 1]], axis=-1)
     fut_local = transform_positions(fut_raw, ego_xy, ego_yaw)
-    offsets = np.diff(np.vstack([np.zeros((1, 2)), fut_local]), axis=0)
-    return offsets.astype(np.float32)
+    return fut_local.astype(np.float32)
 
 
 def get_ego_vec(scenario, ego_idx, t):
