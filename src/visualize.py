@@ -22,6 +22,42 @@ from src.extract import extract_example, get_ego_frame
 from src.transforms import inverse_transform_positions
 
 
+def pick_dynamic_scenario(scenarios, min_displacement=15.0):
+    """Returns the first scenario where the ego's net displacement over the full
+    9s is at least min_displacement meters. Some WOMD scenarios have a mostly
+    stationary ego (e.g. waiting at a light) -- nothing wrong with the data,
+    but it makes for a degenerate-looking, uninformative visualization. Picking
+    a scenario where the car actually goes somewhere is just a better demo."""
+    for scenario in scenarios:
+        ego_idx = int(np.argmax(scenario.object_metadata.is_sdc))
+        traj = scenario.log_trajectory
+        valid = np.array(traj.valid[ego_idx])
+        xy = np.stack([np.array(traj.x[ego_idx])[valid], np.array(traj.y[ego_idx])[valid]], axis=-1)
+        if len(xy) < 2:
+            continue
+        net_disp = np.linalg.norm(xy[-1] - xy[0])
+        if net_disp >= min_displacement:
+            return scenario
+    print(f"no scenario found with net displacement >= {min_displacement}m; returning first scenario anyway")
+    return scenarios[0]
+
+
+def is_turning_scenario(scenario, min_heading_change_deg=25.0, min_displacement=5.0):
+    """Same test as pick_turning_scenario, but returns True/False for one
+    scenario -- used to break metrics down by scenario type instead of just
+    picking a demo."""
+    ego_idx = int(np.argmax(scenario.object_metadata.is_sdc))
+    traj = scenario.log_trajectory
+    valid = np.array(traj.valid[ego_idx])
+    yaw = np.array(traj.yaw[ego_idx])[valid]
+    xy = np.stack([np.array(traj.x[ego_idx])[valid], np.array(traj.y[ego_idx])[valid]], axis=-1)
+    if len(yaw) < 2:
+        return False
+    heading_change = np.degrees(np.abs(np.unwrap(yaw)[-1] - np.unwrap(yaw)[0]))
+    displacement = np.linalg.norm(xy[-1] - xy[0])
+    return heading_change >= min_heading_change_deg and displacement >= min_displacement
+
+
 def pick_turning_scenario(scenarios, min_heading_change_deg=25.0, min_displacement=5.0):
     """Returns the first scenario where the ego's heading changes by at least
     min_heading_change_deg over the full 9s (net, unwrapped -- handles the
@@ -45,27 +81,7 @@ def pick_turning_scenario(scenarios, min_heading_change_deg=25.0, min_displaceme
     return scenarios[0]
 
 
-def pick_dynamic_scenario(scenarios, min_displacement=15.0):
-    """Returns the first scenario where the ego's net displacement over the full
-    9s is at least min_displacement meters. Some WOMD scenarios have a mostly
-    stationary ego (e.g. waiting at a light) -- nothing wrong with the data,
-    but it makes for a degenerate-looking, uninformative visualization. Picking
-    a scenario where the car actually goes somewhere is just a better demo."""
-    for scenario in scenarios:
-        ego_idx = int(np.argmax(scenario.object_metadata.is_sdc))
-        traj = scenario.log_trajectory
-        valid = np.array(traj.valid[ego_idx])
-        xy = np.stack([np.array(traj.x[ego_idx])[valid], np.array(traj.y[ego_idx])[valid]], axis=-1)
-        if len(xy) < 2:
-            continue
-        net_disp = np.linalg.norm(xy[-1] - xy[0])
-        if net_disp >= min_displacement:
-            return scenario
-    print(f"no scenario found with net displacement >= {min_displacement}m; returning first scenario anyway")
-    return scenarios[0]
-
-
-def plot_loss_curves(train_losses, val_losses, save_path=None):
+def plot_loss_curves(train_losses, val_losses):
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(train_losses, label="train")
     ax.plot(val_losses, label="val")
@@ -73,9 +89,6 @@ def plot_loss_curves(train_losses, val_losses, save_path=None):
     ax.set_ylabel("MSE loss (position space)")
     ax.legend()
     ax.set_title("Stage 1 training curves")
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"saved to {save_path}")
     plt.show()
 
 
@@ -93,24 +106,6 @@ def play_scenario_clip(scenario, fps=10):
         frame_state = dataclasses.replace(scenario, timestep=t)
         images.append(visualization.plot_simulator_state(frame_state, use_log_traj=True))
     mediapy.show_video(images, fps=fps)
-
-
-def save_scenario_clip(scenario, out_path="scenario_clip.mp4", fps=10):
-    """Same rendering as play_scenario_clip, but writes it to disk instead of
-    (or in addition to) playing it inline -- for pulling out a shareable clip,
-    e.g. for a blog post or the README."""
-    from waymax import visualization
-    import mediapy
-    import dataclasses
-
-    num_frames = scenario.log_trajectory.x.shape[1]
-    images = []
-    for t in range(num_frames):
-        frame_state = dataclasses.replace(scenario, timestep=t)
-        images.append(visualization.plot_simulator_state(frame_state, use_log_traj=True))
-    mediapy.write_video(out_path, images, fps=fps)
-    print(f"saved to {out_path}")
-    return out_path
 
 
 def _plot_world_scene(ax, scenario, t, window=60.0):
@@ -142,7 +137,7 @@ def _plot_world_scene(ax, scenario, t, window=60.0):
 
 
 def plot_world_frame_snapshots(model, scenario, hist_len=10, future_len=30,
-                                num_snapshots=4, window=60.0, device="cpu", save_path=None):
+                                num_snapshots=4, window=60.0, device="cpu"):
     """Grid of snapshots, real world coordinates. Each panel: the actual scene
     (roadgraph, all agents, ego's past trail) plus logged future (green) and
     predicted future (red dashed) -- predicted brought back to world frame
@@ -186,7 +181,4 @@ def plot_world_frame_snapshots(model, scenario, hist_len=10, future_len=30,
     axes[0].legend(loc="upper left", fontsize=8)
     fig.suptitle("Prediction snapshots -- real world coordinates")
     plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"saved to {save_path}")
     plt.show()
