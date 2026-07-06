@@ -67,6 +67,9 @@ idea itself, being more selective about which agents actually matter, tied to
 where the car is actually headed, rather than looking at everyone nearby all
 the time.
 
+![Visualisation of learned trajectory](unknown.png)
+
+
 ## Repo layout
 
 ```
