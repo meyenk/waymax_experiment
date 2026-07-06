@@ -49,6 +49,8 @@ Dataset, using the Waymax simulator. There are some visualizations too, the
 real driving clip alongside what the model predicted, so it's easy to see how
 it's actually doing rather than just looking at a loss number.
 
+![Visualisation of learned trajectory](unknown.png)
+
 A note on scale: the full dataset has hundreds of thousands of scenarios, and
 what's been run so far only uses a portion of it, capped mainly to keep
 training times reasonable while things are still being worked out. Worth
@@ -67,7 +69,6 @@ idea itself, being more selective about which agents actually matter, tied to
 where the car is actually headed, rather than looking at everyone nearby all
 the time.
 
-![Visualisation of learned trajectory](unknown.png)
 
 
 ## Repo layout
