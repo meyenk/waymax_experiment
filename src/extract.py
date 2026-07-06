@@ -43,39 +43,38 @@ def get_ego_frame(scenario, ego_idx, t):
 
 def extract_agents(scenario, ego_idx, t, hist_len=10):
     """Non-ego agents, history window [t-hist_len+1, t], ego frame.
-    Returns hist_feats (MAX_AGENTS, hist_len, 6), class_ids (MAX_AGENTS,), mask (MAX_AGENTS,)."""
+    Returns hist_feats (MAX_AGENTS, hist_len, 6), class_ids (MAX_AGENTS,), mask (MAX_AGENTS,).
+    Vectorized across agents (no per-agent Python loop) -- this was the main
+    slow part of extraction before."""
     traj = scenario.log_trajectory
     ego_xy, ego_yaw, ego_vxvy = get_ego_frame(scenario, ego_idx, t)
     t0 = t - hist_len + 1
     if t0 < 0:
         return None  # not enough history at this t
 
-    num_objects = traj.x.shape[0]
-    feats_list, class_list, keep = [], [], []
-    for i in range(num_objects):
-        if i == ego_idx:
-            continue
-        if not np.all(traj.valid[i, t0:t + 1]):
-            continue  # require a full, valid history window for this agent
-        xy_raw = np.stack([traj.x[i, t0:t + 1], traj.y[i, t0:t + 1]], axis=-1)
-        xy = transform_positions(xy_raw, ego_xy, ego_yaw)
-        yaw = transform_yaw(traj.yaw[i, t0:t + 1], ego_yaw)
-        v_raw = np.stack([traj.vel_x[i, t0:t + 1], traj.vel_y[i, t0:t + 1]], axis=-1)
-        v_rel = transform_velocities(v_raw, ego_vxvy, ego_yaw)
-        feats = np.concatenate([xy, np.cos(yaw)[:, None], np.sin(yaw)[:, None], v_rel], axis=-1)
-        feats_list.append(feats.astype(np.float32))
-        # ADAPT: object_metadata.object_types field name/encoding may differ
-        class_list.append(int(scenario.object_metadata.object_types[i]))
+    valid_window = np.array(traj.valid[:, t0:t + 1])   # (num_objects, hist_len)
+    full_valid = valid_window.all(axis=1)               # (num_objects,)
+    full_valid[ego_idx] = False                          # exclude ego
+    idx = np.where(full_valid)[0]
 
-    if not feats_list:
+    if len(idx) == 0:
         return {
             "hist": np.zeros((MAX_AGENTS, hist_len, 6), dtype=np.float32),
             "class": np.zeros(MAX_AGENTS, dtype=np.int64),
             "mask": np.zeros(MAX_AGENTS, dtype=bool),
         }
-    hist = np.stack(feats_list)                 # (n, hist_len, 6)
-    hist, mask = _pad(hist, MAX_AGENTS)
-    cls = np.array(class_list, dtype=np.int64)
+
+    xy_raw = np.stack([np.array(traj.x)[idx, t0:t + 1], np.array(traj.y)[idx, t0:t + 1]], axis=-1)
+    xy = transform_positions(xy_raw, ego_xy, ego_yaw)
+    yaw = transform_yaw(np.array(traj.yaw)[idx, t0:t + 1], ego_yaw)
+    v_raw = np.stack([np.array(traj.vel_x)[idx, t0:t + 1], np.array(traj.vel_y)[idx, t0:t + 1]], axis=-1)
+    v_rel = transform_velocities(v_raw, ego_vxvy, ego_yaw)
+    feats = np.concatenate([xy, np.cos(yaw)[..., None], np.sin(yaw)[..., None], v_rel], axis=-1).astype(np.float32)
+
+    # ADAPT: object_metadata.object_types field name/encoding may differ
+    cls = np.array(scenario.object_metadata.object_types)[idx].astype(np.int64)
+
+    hist, mask = _pad(feats, MAX_AGENTS)
     cls, _ = _pad(cls, MAX_AGENTS)
     return {"hist": hist, "class": cls, "mask": mask}
 
@@ -103,35 +102,30 @@ def extract_map(scenario, ego_idx, t):
 def extract_traffic_lights(scenario, ego_idx, t, hist_len=10):
     """Traffic light stop-line positions + state over history, ego frame.
     ADAPT: field name/shape for your Waymax version -- assumed scenario.log_traffic_light
-    with .x, .y, .state, .valid shaped (num_lights, num_timesteps)."""
+    with .x, .y, .state, .valid shaped (num_lights, num_timesteps).
+    Vectorized across lights (no per-light Python loop)."""
     ego_xy, ego_yaw, _ = get_ego_frame(scenario, ego_idx, t)
     t0 = t - hist_len + 1
+    empty = {
+        "hist_xy": np.zeros((MAX_LIGHTS, hist_len, 2), dtype=np.float32),
+        "state": np.zeros((MAX_LIGHTS, hist_len), dtype=np.int64),
+        "mask": np.zeros(MAX_LIGHTS, dtype=bool),
+    }
     if t0 < 0 or not hasattr(scenario, "log_traffic_light"):
-        return {
-            "hist_xy": np.zeros((MAX_LIGHTS, hist_len, 2), dtype=np.float32),
-            "state": np.zeros((MAX_LIGHTS, hist_len), dtype=np.int64),
-            "mask": np.zeros(MAX_LIGHTS, dtype=bool),
-        }
-    tl = scenario.log_traffic_light
-    num_lights = tl.x.shape[0]
-    hist_list, state_list = [], []
-    for i in range(num_lights):
-        if not np.all(tl.valid[i, t0:t + 1]):
-            continue
-        xy_raw = np.stack([tl.x[i, t0:t + 1], tl.y[i, t0:t + 1]], axis=-1)
-        xy = transform_positions(xy_raw, ego_xy, ego_yaw)
-        hist_list.append(xy.astype(np.float32))
-        state_list.append(tl.state[i, t0:t + 1].astype(np.int64))
+        return empty
 
-    if not hist_list:
-        return {
-            "hist_xy": np.zeros((MAX_LIGHTS, hist_len, 2), dtype=np.float32),
-            "state": np.zeros((MAX_LIGHTS, hist_len), dtype=np.int64),
-            "mask": np.zeros(MAX_LIGHTS, dtype=bool),
-        }
-    hist_xy = np.stack(hist_list)
-    hist_xy, mask = _pad(hist_xy, MAX_LIGHTS)
-    state = np.stack(state_list)
+    tl = scenario.log_traffic_light
+    valid_window = np.array(tl.valid[:, t0:t + 1])
+    full_valid = valid_window.all(axis=1)
+    idx = np.where(full_valid)[0]
+    if len(idx) == 0:
+        return empty
+
+    xy_raw = np.stack([np.array(tl.x)[idx, t0:t + 1], np.array(tl.y)[idx, t0:t + 1]], axis=-1)
+    xy = transform_positions(xy_raw, ego_xy, ego_yaw).astype(np.float32)
+    state = np.array(tl.state)[idx, t0:t + 1].astype(np.int64)
+
+    hist_xy, mask = _pad(xy, MAX_LIGHTS)
     state, _ = _pad(state, MAX_LIGHTS)
     return {"hist_xy": hist_xy, "state": state, "mask": mask}
 
