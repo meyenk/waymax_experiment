@@ -9,14 +9,18 @@ simulation, not the log:
     mpc.py), driven by whatever's actually ahead of them each step, which
     may now be our diverging ego.
 
-KNOWN LIMITATION addressed in Part B, task 1: agents currently move in a
-straight line at a fixed heading (see mpc.py's bicycle_free) instead of
-following their logged path's actual curvature.
+Part B, task 1 (done): other agents path-follow their logged path's actual
+curvature via a cached arc-length parameterization (see mpc.py's AgentPath),
+instead of moving in a straight line at a fixed heading. IDM only ever
+controls how fast an agent moves.
 
-KNOWN LIMITATION addressed in Part B, task 2: the agent-history and
-light-history features fed to the model are all anchored to the ego's pose
-at the CURRENT decision instant, not to the ego's pose at each individual
-historical timestep. See build_model_batch below.
+Part B, task 2 (done): the agent-history and light-history features fed to
+the model are time-matched (tau) -- each historical instant is expressed
+relative to the ego's own pose at THAT instant, not the ego's pose at the
+current decision instant t. See build_model_batch below. This changes the
+model's input feature values (not their dimensionality), so the existing
+checkpoints (stage1_weights.pth, best_weights_v2.pth) are stale against this
+code and a retrain is required before using them again.
 
 Only two things still come from the log every step, because they're
 exogenous (not affected by any agent's actions):
@@ -278,36 +282,44 @@ def get_light_window_world(scenario, t, hist_len):
 # ---------------------------------------------------------------------------
 
 def build_model_batch(agent_hist_world, agent_cls, map_xy_world, map_types,
-                       light_hist_world_xy, light_state, ego_world_xy, ego_yaw,
-                       ego_speed, map_radius=80.0):
+                       light_hist_world_xy, light_state,
+                       ego_hist_xy, ego_hist_yaw, ego_hist_vxvy, map_radius=80.0):
     """All *_world inputs are plain numpy in world frame; returns a batch
     dict of torch tensors (batch size 1) in the model's expected ego-local
-    frame, built fresh from our own current ego pose.
+    frame.
 
-    NOTE (Part B, task 2 will change this function): every historical
-    timestep in agent_hist_world/light_hist_world_xy is currently transformed
-    using this SAME (ego_world_xy, ego_yaw, ego_speed) triple -- i.e. the
-    ego's pose at the CURRENT decision instant, not at each individual
-    historical timestep. See Part B, task 2 spec below for the fix."""
-    # agents: (N, hist_len, 4) world -> (N, hist_len, 6) ego-local feats
+    ego_hist_xy/ego_hist_yaw/ego_hist_vxvy: (hist_len,2)/(hist_len,)/(hist_len,2)
+    -- the ego's own state at EACH individual historical instant tau, not
+    just the current decision instant t (Part B, task 2: time-matched/tau
+    convention). The current instant is simply this window's last entry. The
+    caller is responsible for the tau<t0 fallback (use the log there, since
+    the ego hadn't diverged from it yet) -- see run_closed_loop.
+
+    Map transform and ego_vec still use only the current (last) entry: the
+    map is a single static snapshot at t with no history, so task 2's
+    time-matching doesn't apply there."""
+    ego_world_xy = ego_hist_xy[-1]
+    ego_yaw = ego_hist_yaw[-1]
+    ego_speed = float(np.hypot(ego_hist_vxvy[-1, 0], ego_hist_vxvy[-1, 1]))
+
+    # agents: (N, hist_len, 4) world -> (N, hist_len, 6) ego-local feats,
+    # each historical entry tau transformed by the ego's OWN state at tau.
     N, hist_len, _ = agent_hist_world.shape
-    xy_local = transform_positions(agent_hist_world[..., :2], ego_world_xy, ego_yaw)
-    yaw_local = transform_yaw(agent_hist_world[..., 2], ego_yaw)
+    xy_local = transform_positions(agent_hist_world[..., :2], ego_hist_xy, ego_hist_yaw)
+    yaw_local = transform_yaw(agent_hist_world[..., 2], ego_hist_yaw)
     # velocity as (vx, vy) isn't tracked in our (x,y,yaw,speed) state; approximate
     # from heading * speed, consistent with how we drive agents in mpc.py.
     vx_world = agent_hist_world[..., 3] * np.cos(agent_hist_world[..., 2])
     vy_world = agent_hist_world[..., 3] * np.sin(agent_hist_world[..., 2])
-    # ego's velocity in WORLD frame is needed for transform_velocities' relative
-    # subtraction to be meaningful; reconstruct it from ego_world_xy's yaw/speed
-    ego_vxvy_world = np.array([ego_speed * np.cos(ego_yaw), ego_speed * np.sin(ego_yaw)])
-    v_rel = transform_velocities(np.stack([vx_world, vy_world], axis=-1), ego_vxvy_world, ego_yaw)
+    v_rel = transform_velocities(np.stack([vx_world, vy_world], axis=-1), ego_hist_vxvy, ego_hist_yaw)
     agent_feats = np.concatenate(
         [xy_local, np.cos(yaw_local)[..., None], np.sin(yaw_local)[..., None], v_rel],
         axis=-1).astype(np.float32)
     agent_hist, agent_mask = _pad(agent_feats, MAX_AGENTS)
     agent_class, _ = _pad(agent_cls, MAX_AGENTS)
 
-    # map: world -> ego-local, radius filter, pad
+    # map: world -> ego-local at the CURRENT instant only, radius filter, pad
+    # -- single static snapshot, no history, task 2 doesn't apply here.
     map_local = transform_positions(map_xy_world, ego_world_xy, ego_yaw)
     dist = np.linalg.norm(map_local, axis=-1)
     keep = dist <= map_radius
@@ -315,9 +327,10 @@ def build_model_batch(agent_hist_world, agent_cls, map_xy_world, map_types,
     map_xy, map_mask = _pad(map_xy_kept, MAX_MAP_POINTS)
     map_type, _ = _pad(map_types_kept, MAX_MAP_POINTS)
 
-    # lights: world -> ego-local, pad
+    # lights: world -> ego-local, same time-matched (tau) convention as
+    # agents (position only -- lights have no yaw/velocity feature), pad
     if light_hist_world_xy.shape[0] > 0:
-        light_local = transform_positions(light_hist_world_xy, ego_world_xy, ego_yaw).astype(np.float32)
+        light_local = transform_positions(light_hist_world_xy, ego_hist_xy, ego_hist_yaw).astype(np.float32)
     else:
         light_local = light_hist_world_xy.astype(np.float32)
     light_hist_xy, light_mask = _pad(light_local, MAX_LIGHTS)
@@ -350,7 +363,15 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
     currently in the sim, path-following via arc length so each agent's
     shape always matches its logged curve while IDM only ever controls its
     speed; agents enter/leave exactly when the log says they should,
-    regardless of how far the ego/other agents have diverged from the log."""
+    regardless of how far the ego/other agents have diverged from the log.
+
+    Ego history (Part B, task 2): build_model_batch needs the ego's own
+    state at EACH historical instant in the window, not just at t. ego_hist_buf
+    is seeded from the log for the very first window (the ego hadn't
+    diverged from the log before t0 anyway, so the log is correct there),
+    then rolled forward with our own persisted simulated ego state every
+    step after that -- so for tau >= t0 it's always our real simulated
+    history, and only the tau < t0 slice ever falls back to the log."""
     model.eval()
 
     traj = scenario.log_trajectory
@@ -358,6 +379,15 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
     ego_yaw0 = float(traj.yaw[ego_idx, t0])
     ego_v0 = float(np.hypot(traj.vel_x[ego_idx, t0], traj.vel_y[ego_idx, t0]))
     ego_state = np.array([ego_xy0[0], ego_xy0[1], ego_yaw0, ego_v0])
+
+    t_hist_start = t0 - hist_len + 1
+    ego_hist_buf = np.stack([
+        np.array(traj.x[ego_idx, t_hist_start:t0 + 1]),
+        np.array(traj.y[ego_idx, t_hist_start:t0 + 1]),
+        np.array(traj.yaw[ego_idx, t_hist_start:t0 + 1]),
+        np.hypot(np.array(traj.vel_x[ego_idx, t_hist_start:t0 + 1]),
+                 np.array(traj.vel_y[ego_idx, t_hist_start:t0 + 1])),
+    ], axis=-1)  # (hist_len, 4) -- from the log; correct pre-t0, since the ego hasn't diverged yet
 
     scene_paths = build_agent_paths(scenario, ego_idx)
     agents = ActiveAgentSet(scene_paths, hist_len)
@@ -373,10 +403,15 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
         if t >= scene_len:
             break
 
+        ego_hist_xy = ego_hist_buf[:, :2]
+        ego_hist_yaw = ego_hist_buf[:, 2]
+        ego_hist_vxvy = np.stack(
+            [ego_hist_buf[:, 3] * np.cos(ego_hist_yaw), ego_hist_buf[:, 3] * np.sin(ego_hist_yaw)], axis=-1)
+
         light_hist_xy, light_state = get_light_window_world(scenario, t, hist_len)
         batch = build_model_batch(
             agents.hist_array(), agents.cls_array(), map_xy_world, map_types,
-            light_hist_xy, light_state, ego_state[:2], ego_state[2], ego_state[3])
+            light_hist_xy, light_state, ego_hist_xy, ego_hist_yaw, ego_hist_vxvy)
         batch = {k: v.to(device) for k, v in batch.items()}
 
         with torch.no_grad():
@@ -398,6 +433,7 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
 
         agents.advance(ego_state, new_ego_state, dt, reactive)
         ego_state = new_ego_state
+        ego_hist_buf = np.concatenate([ego_hist_buf[1:], ego_state[None, :]], axis=0)
 
         log["ego_states"].append(ego_state.copy())
         log["agent_states"].append(agents.states_array())

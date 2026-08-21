@@ -33,7 +33,9 @@ def _pad(arr, max_n):
 
 
 def get_ego_frame(scenario, ego_idx, t):
-    """Returns (ego_xy, ego_yaw, ego_vxvy) at time t -- the frame anchor."""
+    """Returns (ego_xy, ego_yaw, ego_vxvy) at time t -- the frame anchor.
+    Single-instant reference, used where there's no history to time-match
+    (the map branch, the ego's own future target space)."""
     traj = scenario.log_trajectory
     ego_xy = np.array([traj.x[ego_idx, t], traj.y[ego_idx, t]])
     ego_yaw = float(traj.yaw[ego_idx, t])
@@ -41,16 +43,32 @@ def get_ego_frame(scenario, ego_idx, t):
     return ego_xy, ego_yaw, ego_vxvy
 
 
+def get_ego_frame_window(scenario, ego_idx, t0, t):
+    """Returns (ego_xy, ego_yaw, ego_vxvy) over the window [t0, t] inclusive
+    -- (hist_len, 2), (hist_len,), (hist_len, 2) -- the ego's own state at
+    EACH individual historical instant, not just at t (Part B, task 2: the
+    time-matched / tau convention, needed so a historical entry is expressed
+    relative to where the ego actually was at that same instant)."""
+    traj = scenario.log_trajectory
+    ego_xy = np.stack([traj.x[ego_idx, t0:t + 1], traj.y[ego_idx, t0:t + 1]], axis=-1)
+    ego_yaw = np.array(traj.yaw[ego_idx, t0:t + 1])
+    ego_vxvy = np.stack([traj.vel_x[ego_idx, t0:t + 1], traj.vel_y[ego_idx, t0:t + 1]], axis=-1)
+    return ego_xy, ego_yaw, ego_vxvy
+
+
 def extract_agents(scenario, ego_idx, t, hist_len=10):
-    """Non-ego agents, history window [t-hist_len+1, t], ego frame.
+    """Non-ego agents, history window [t-hist_len+1, t], time-matched (tau)
+    ego frame: each historical instant is expressed relative to the ego's
+    own state at that same instant, not the ego's state at the current
+    decision instant t (Part B, task 2).
     Returns hist_feats (MAX_AGENTS, hist_len, 6), class_ids (MAX_AGENTS,), mask (MAX_AGENTS,).
     Vectorized across agents (no per-agent Python loop) -- this was the main
     slow part of extraction before."""
     traj = scenario.log_trajectory
-    ego_xy, ego_yaw, ego_vxvy = get_ego_frame(scenario, ego_idx, t)
     t0 = t - hist_len + 1
     if t0 < 0:
         return None  # not enough history at this t
+    ego_xy, ego_yaw, ego_vxvy = get_ego_frame_window(scenario, ego_idx, t0, t)
 
     valid_window = np.array(traj.valid[:, t0:t + 1])   # (num_objects, hist_len)
     full_valid = valid_window.all(axis=1)               # (num_objects,)
@@ -100,11 +118,12 @@ def extract_map(scenario, ego_idx, t):
 
 
 def extract_traffic_lights(scenario, ego_idx, t, hist_len=10):
-    """Traffic light stop-line positions + state over history, ego frame.
+    """Traffic light stop-line positions + state over history, time-matched
+    (tau) ego frame -- position only, lights have no yaw/velocity feature
+    (Part B, task 2).
     ADAPT: field name/shape for your Waymax version -- assumed scenario.log_traffic_light
     with .x, .y, .state, .valid shaped (num_lights, num_timesteps).
     Vectorized across lights (no per-light Python loop)."""
-    ego_xy, ego_yaw, _ = get_ego_frame(scenario, ego_idx, t)
     t0 = t - hist_len + 1
     empty = {
         "hist_xy": np.zeros((MAX_LIGHTS, hist_len, 2), dtype=np.float32),
@@ -113,6 +132,7 @@ def extract_traffic_lights(scenario, ego_idx, t, hist_len=10):
     }
     if t0 < 0 or not hasattr(scenario, "log_traffic_light"):
         return empty
+    ego_xy, ego_yaw, _ = get_ego_frame_window(scenario, ego_idx, t0, t)
 
     tl = scenario.log_traffic_light
     valid_window = np.array(tl.valid[:, t0:t + 1])
