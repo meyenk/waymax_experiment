@@ -39,7 +39,7 @@ import torch
 
 from src.transforms import transform_positions, transform_velocities, transform_yaw
 from src.dynamics import bicycle_step
-from src.mpc import run_mpc_step, rollout_other_agents
+from src.mpc import run_mpc_step, rollout_other_agents, AgentPath
 
 MAX_AGENTS = 32
 MAX_MAP_POINTS = 200
@@ -70,7 +70,12 @@ def init_other_agents(scenario, ego_idx, t0, hist_len):
     Returns: world_states0 (N,4) [x,y,yaw,speed] at t0, class_ids (N,),
     hist_world (N, hist_len, 4) for the buffer, built from the log over
     [t0-hist_len+1, t0] (missing history at scene start is a real edge case
-    -- caller should pick t0 >= hist_len-1)."""
+    -- caller should pick t0 >= hist_len-1).
+
+    Kept as-is (t0-only snapshot) for callers that don't need path-following
+    (e.g. standalone use). run_closed_loop itself now uses
+    build_agent_paths + ActiveAgentSet below, which scans the whole scene
+    once and tracks agents entering/leaving over time (Part B, task 1)."""
     traj = scenario.log_trajectory
     valid_t0 = np.array(traj.valid[:, t0]).copy()
     valid_t0[ego_idx] = False
@@ -96,6 +101,144 @@ def init_other_agents(scenario, ego_idx, t0, hist_len):
     hist_world = np.stack([hx, hy, hyaw, hspeed], axis=-1)  # (N, hist_len, 4)
 
     return world_states0, cls, hist_world, idx
+
+
+# ---------------------------------------------------------------------------
+# Part B, task 1 -- whole-scene scan + path-following active agent set.
+# ---------------------------------------------------------------------------
+
+def build_agent_paths(scenario, ego_idx):
+    """Whole-scene scan, done once at load time (not per-agent-entry): for
+    every non-ego object index in scenario.log_trajectory, find its valid
+    span (first/last valid timestep) and cache its logged (x, y) waypoints
+    across that span as an AgentPath. This repo assumes each object has one
+    contiguous valid span (appears once, drives, disappears once) -- a gappy
+    validity mask is flagged (raised), not silently handled, since the Task 1
+    plan doesn't cover that case.
+
+    Returns dict: paths {obj_idx: AgentPath}, first_valid {obj_idx: int},
+    last_valid {obj_idx: int}, cls {obj_idx: int} (object class id).
+    Objects that are never valid (all-False mask) are skipped."""
+    traj = scenario.log_trajectory
+    valid = np.array(traj.valid)  # (num_objects, T)
+    x = np.array(traj.x)
+    y = np.array(traj.y)
+    obj_types = np.array(scenario.object_metadata.object_types)
+    num_objects = valid.shape[0]
+
+    paths, first_valid, last_valid, cls = {}, {}, {}, {}
+    for i in range(num_objects):
+        if i == ego_idx:
+            continue
+        valid_i = valid[i]
+        if not valid_i.any():
+            continue
+        idx_t = np.where(valid_i)[0]
+        t_first, t_last = int(idx_t[0]), int(idx_t[-1])
+        if not valid_i[t_first:t_last + 1].all():
+            raise ValueError(
+                f"object {i} has a gappy validity mask between t={t_first} and "
+                f"t={t_last} (some timesteps in between are invalid). Part B "
+                f"task 1's plan assumes one contiguous valid span per object "
+                f"and explicitly doesn't cover this case -- flagging rather "
+                f"than silently handling it.")
+        wp_xy = np.stack([x[i, t_first:t_last + 1], y[i, t_first:t_last + 1]], axis=-1)
+        paths[i] = AgentPath(wp_xy)
+        first_valid[i] = t_first
+        last_valid[i] = t_last
+        cls[i] = int(obj_types[i])
+    return {"paths": paths, "first_valid": first_valid, "last_valid": last_valid, "cls": cls}
+
+
+def _agent_world_state(scenario, obj_idx, t):
+    """(x, y, yaw, speed) for object obj_idx straight from the log at time t."""
+    traj = scenario.log_trajectory
+    x = float(traj.x[obj_idx, t])
+    y = float(traj.y[obj_idx, t])
+    yaw = float(traj.yaw[obj_idx, t])
+    speed = float(np.hypot(traj.vel_x[obj_idx, t], traj.vel_y[obj_idx, t]))
+    return np.array([x, y, yaw, speed])
+
+
+class ActiveAgentSet:
+    """Tracks the non-ego agents currently in the real (simulated) closed
+    loop: per-agent arc length `s` along its cached AgentPath (Part B, task
+    1), current world (x, y, yaw, speed), object class, and a rolling
+    hist_len-step history buffer of derived world states for the model.
+
+    Agents enter when their first-valid-timestep (per the log's own
+    timeline) equals the current real t, and leave the moment the log marks
+    them invalid at the current real t (fallback case 2 -- distinct from
+    "ran past the end of the known path", which is fallback case 1, handled
+    inside bicycle_free/rollout_other_agents via path.exhausted)."""
+
+    def __init__(self, scene_paths, hist_len):
+        self.scene_paths = scene_paths
+        self.hist_len = hist_len
+        self.order = []            # active obj_idx, fixed iteration order
+        self.s = {}                # obj_idx -> float arc length
+        self.state = {}            # obj_idx -> (4,) world
+        self.hist = {}             # obj_idx -> (hist_len, 4) world, oldest..newest
+
+    def sync(self, scenario, t):
+        """Drop agents invalid at t (log fact, fallback case 2); add agents
+        whose first-valid-timestep is exactly t (well-defined even though
+        the ego/other agents may have diverged from the log, since validity
+        is purely a property of the log's own timeline)."""
+        traj = scenario.log_trajectory
+        valid_t = np.array(traj.valid[:, t])
+
+        for obj_idx in list(self.order):
+            if not valid_t[obj_idx]:
+                self.order.remove(obj_idx)
+                del self.s[obj_idx], self.state[obj_idx], self.hist[obj_idx]
+
+        for obj_idx, t_first in self.scene_paths["first_valid"].items():
+            if t_first == t and obj_idx not in self.s:
+                state0 = _agent_world_state(scenario, obj_idx, t)
+                self.order.append(obj_idx)
+                self.s[obj_idx] = 0.0
+                self.state[obj_idx] = state0
+                # no real history yet -- backfill the buffer by holding this
+                # single known state across the whole window, consistent
+                # with how padding/invalid slots are treated elsewhere.
+                self.hist[obj_idx] = np.tile(state0, (self.hist_len, 1))
+
+    def is_empty(self):
+        return len(self.order) == 0
+
+    def states_array(self):
+        return np.stack([self.state[i] for i in self.order], axis=0) if self.order \
+            else np.zeros((0, 4))
+
+    def hist_array(self):
+        return np.stack([self.hist[i] for i in self.order], axis=0) if self.order \
+            else np.zeros((0, self.hist_len, 4))
+
+    def cls_array(self):
+        return np.array([self.scene_paths["cls"][i] for i in self.order], dtype=np.int64)
+
+    def paths_list(self):
+        return [self.scene_paths["paths"][i] for i in self.order]
+
+    def s_array(self):
+        return np.array([self.s[i] for i in self.order], dtype=float)
+
+    def advance(self, ego_state, new_ego_state, dt, reactive):
+        """Step every active agent forward exactly one real timestep, path-
+        following via its cached AgentPath (Part B, task 1), and update the
+        rolling history buffers."""
+        if self.is_empty():
+            return
+        two_step_ego = np.stack([ego_state, new_ego_state])
+        new_states, new_s = rollout_other_agents(
+            self.states_array(), two_step_ego, horizon=1, dt=dt, reactive=reactive,
+            paths=self.paths_list(), s0=self.s_array())
+        for k, obj_idx in enumerate(self.order):
+            self.state[obj_idx] = new_states[k, 1, :]
+            self.s[obj_idx] = new_s[k]
+            self.hist[obj_idx] = np.concatenate(
+                [self.hist[obj_idx][1:], self.state[obj_idx][None, :]], axis=0)
 
 
 def init_map_points(scenario, radius_center_xy, cache_radius=200.0):
@@ -199,7 +342,15 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
                      hist_len=10, future_len=30, n_candidates=32,
                      r_min=1.0, r_max=10.0, reactive=True, device="cpu"):
     """Returns a dict with per-step logs: ego_states (list of (4,) world),
-    agent_states (list of (N,4) world), selection_modes (list of str)."""
+    agent_states (list of (N,4) world), selection_modes (list of str).
+
+    Other agents (Part B, task 1): the whole scene is scanned once up front
+    (build_agent_paths) to find every object's valid span and cache its
+    logged path. From then on, an ActiveAgentSet tracks which agents are
+    currently in the sim, path-following via arc length so each agent's
+    shape always matches its logged curve while IDM only ever controls its
+    speed; agents enter/leave exactly when the log says they should,
+    regardless of how far the ego/other agents have diverged from the log."""
     model.eval()
 
     traj = scenario.log_trajectory
@@ -208,10 +359,12 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
     ego_v0 = float(np.hypot(traj.vel_x[ego_idx, t0], traj.vel_y[ego_idx, t0]))
     ego_state = np.array([ego_xy0[0], ego_xy0[1], ego_yaw0, ego_v0])
 
-    other_states, agent_cls, agent_hist_buf, agent_idx = init_other_agents(scenario, ego_idx, t0, hist_len)
+    scene_paths = build_agent_paths(scenario, ego_idx)
+    agents = ActiveAgentSet(scene_paths, hist_len)
+    agents.sync(scenario, t0)
     map_xy_world, map_types = init_map_points(scenario, ego_xy0)
 
-    log = {"ego_states": [ego_state.copy()], "agent_states": [other_states.copy()],
+    log = {"ego_states": [ego_state.copy()], "agent_states": [agents.states_array()],
            "selection_modes": [], "ref_trajectories": []}
 
     scene_len = traj.x.shape[1]
@@ -222,7 +375,7 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
 
         light_hist_xy, light_state = get_light_window_world(scenario, t, hist_len)
         batch = build_model_batch(
-            agent_hist_buf, agent_cls, map_xy_world, map_types,
+            agents.hist_array(), agents.cls_array(), map_xy_world, map_types,
             light_hist_xy, light_state, ego_state[:2], ego_state[2], ego_state[3])
         batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -230,6 +383,7 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
             pred, _ = model(batch)
         ref_trajectory_xy = pred[0].cpu().numpy()  # (future_len, 2), ego-local
 
+        other_states = agents.states_array()
         other_xy_local = transform_positions(other_states[:, :2], ego_state[:2], ego_state[2])
         other_yaw_local = transform_yaw(other_states[:, 2], ego_state[2])
         other_local = np.stack([other_xy_local[:, 0], other_xy_local[:, 1],
@@ -242,21 +396,19 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
         accel, steer = mpc_out["first_control"]
         new_ego_state = bicycle_step(ego_state, (accel, steer), dt)
 
-        if other_states.shape[0] > 0:
-            two_step_ego = np.stack([ego_state, new_ego_state])
-            new_other_states = rollout_other_agents(
-                other_states, two_step_ego, horizon=1, dt=dt, reactive=reactive)[:, 1, :]
-        else:
-            new_other_states = other_states
-
-        agent_hist_buf = np.concatenate([agent_hist_buf[:, 1:, :], new_other_states[:, None, :]], axis=1) \
-            if other_states.shape[0] > 0 else agent_hist_buf
-        ego_state, other_states = new_ego_state, new_other_states
+        agents.advance(ego_state, new_ego_state, dt, reactive)
+        ego_state = new_ego_state
 
         log["ego_states"].append(ego_state.copy())
-        log["agent_states"].append(other_states.copy())
+        log["agent_states"].append(agents.states_array())
         log["selection_modes"].append(mpc_out["selection_mode"])
         log["ref_trajectories"].append(ref_trajectory_xy)
 
-    log["agent_idx"] = agent_idx
+        # agents entering mid-scene at the NEXT real timestep are picked up
+        # here so their history buffer/state exist before the next step's
+        # model batch is built.
+        if t + 1 < scene_len:
+            agents.sync(scenario, t + 1)
+
+    log["agent_idx"] = np.array(agents.order)
     return log

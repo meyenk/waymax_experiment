@@ -38,6 +38,52 @@ from src.dynamics import rollout_bicycle, infer_reference_controls, WHEELBASE
 IDM_DEFAULTS = dict(v0=15.0, T=1.5, a_max=1.5, b_comf=2.0, s0=2.0, delta=4.0)
 
 
+# ---------------------------------------------------------------------------
+# Part B, task 1 -- cached logged path per agent, arc-length parameterized.
+# IDM only ever controls *how fast* an agent moves; the *shape* of its path
+# always matches the log, via lookup(s) below. Pure numpy, no Waymax
+# dependency, so it stays unit-testable standalone like the rest of this file.
+# ---------------------------------------------------------------------------
+
+class AgentPath:
+    """Cached (x, y) waypoints for one non-ego agent across its own valid
+    span in the log, parameterized by cumulative arc length `s` (0 at the
+    agent's first valid timestep)."""
+
+    def __init__(self, waypoints_xy):
+        waypoints_xy = np.asarray(waypoints_xy, dtype=float)
+        if waypoints_xy.ndim != 2 or waypoints_xy.shape[1] != 2 or waypoints_xy.shape[0] < 1:
+            raise ValueError("waypoints_xy must be (M, 2) with M >= 1")
+        self.waypoints_xy = waypoints_xy
+        if waypoints_xy.shape[0] == 1:
+            self.cum_s = np.array([0.0])
+        else:
+            seg_len = np.hypot(np.diff(waypoints_xy[:, 0]), np.diff(waypoints_xy[:, 1]))
+            self.cum_s = np.concatenate([[0.0], np.cumsum(seg_len)])
+        self.total_length = float(self.cum_s[-1])
+
+    def lookup(self, s):
+        """Returns (x, y, yaw) at arc length s. s is clamped to
+        [0, total_length] -- callers that need the "ran past the end of the
+        known path" behavior (fallback case 1, see bicycle_free) must check
+        that themselves before calling this with an out-of-range s."""
+        if self.waypoints_xy.shape[0] == 1:
+            return self.waypoints_xy[0, 0], self.waypoints_xy[0, 1], 0.0
+        s_clamped = float(np.clip(s, 0.0, self.total_length))
+        i = int(np.clip(np.searchsorted(self.cum_s, s_clamped, side="right") - 1,
+                         0, len(self.cum_s) - 2))
+        s0, s1 = self.cum_s[i], self.cum_s[i + 1]
+        p0, p1 = self.waypoints_xy[i], self.waypoints_xy[i + 1]
+        frac = 0.0 if s1 <= s0 else (s_clamped - s0) / (s1 - s0)
+        xy = p0 + frac * (p1 - p0)
+        dx, dy = p1 - p0
+        yaw = np.arctan2(dy, dx)
+        return float(xy[0]), float(xy[1]), float(yaw)
+
+    def exhausted(self, s):
+        return s > self.total_length
+
+
 def idm_accel(v, v_lead, gap, params=None):
     """Standard IDM formula. gap: bumper-to-bumper distance to leader (m).
     If there's no leader, call with gap=large (e.g. 1e6) and v_lead=v0."""
@@ -72,24 +118,43 @@ def _find_leader(idx, positions, yaws, corridor_half_width=1.5):
     return best_gap, best_j
 
 
-def rollout_other_agents(agent_states, ego_states, horizon, dt, reactive=True, params=None):
+def rollout_other_agents(agent_states, ego_states, horizon, dt, reactive=True, params=None,
+                          paths=None, s0=None):
     """agent_states: (N, 4) array of (x, y, yaw, v) for N other agents at t=0.
     ego_states: (horizon+1, 4) the ego's already-decided rollout for this
     candidate (agents react to it, per the professor's point about replanning
     invalidating a fixed logged future).
-    Each agent keeps constant yaw/heading (no lane-change modeling) and only
-    IDM-controls its speed along that heading.
+    IDM only ever controls each agent's speed; how its heading evolves
+    depends on `paths` (Part B, task 1):
+      paths=None (default, matches Part A exactly): every agent keeps
+        constant yaw/heading (no lane-change modeling) for the whole
+        rollout -- unchanged legacy behavior, and the return value is just
+        the (N, horizon+1, 4) states array as before.
+      paths=list of length N (AgentPath or None per agent), s0=(N,) initial
+        arc length: agents with a real AgentPath entry follow that path's
+        curvature instead of a frozen heading; agents whose path entry is
+        None fall back to the frozen-heading behavior for that agent only.
+        Returns (states, s_final) in this mode -- s_final is the (N,)
+        updated arc length, needed by the caller to continue next step.
     reactive=False: agents hold constant velocity (used for on/off comparison).
-    Returns (N, horizon+1, 4) states including t=0.
     """
     N = agent_states.shape[0]
     states = np.zeros((N, horizon + 1, 4))
     states[:, 0, :] = agent_states
+    s_cur = np.array(s0, dtype=float).copy() if s0 is not None else None
+
+    def _step(i, t, accel):
+        path_i = paths[i] if paths is not None else None
+        if path_i is None:
+            states[i, t + 1] = bicycle_free(states[i, t], dt, accel=accel)
+        else:
+            new_state, s_cur[i] = bicycle_free(states[i, t], dt, accel=accel, path=path_i, s=s_cur[i])
+            states[i, t + 1] = new_state
 
     for t in range(horizon):
         if not reactive:
             for i in range(N):
-                states[i, t + 1] = bicycle_free(states[i, t], dt)
+                _step(i, t, accel=0.0)
             continue
 
         # gather all objects (agents + ego) at this timestep for leader search
@@ -104,20 +169,49 @@ def rollout_other_agents(agent_states, ego_states, horizon, dt, reactive=True, p
                 accel = idm_accel(v, IDM_DEFAULTS["v0"], gap=1e6)
             else:
                 accel = idm_accel(v, speeds[j], gap=gap, params=params)
-            states[i, t + 1] = bicycle_free(states[i, t], dt, accel=accel)
+            _step(i, t, accel)
 
+    if paths is not None:
+        return states, s_cur
     return states
 
 
-def bicycle_free(state, dt, accel=0.0):
-    """Move a non-ego agent forward along its own constant heading (no
-    steering input). See KNOWN LIMITATION note above -- Part B, task 1
-    replaces the constant-heading assumption with path-following."""
+def bicycle_free(state, dt, accel=0.0, path=None, s=None):
+    """Move a non-ego agent forward one step.
+    path=None (default, matches Part A exactly): move in a straight line at
+      the frozen heading stored in `state` -- no steering input. See KNOWN
+      LIMITATION note above -- Part B, task 1 replaces this assumption with
+      path-following when a path is given.
+    path=an AgentPath, s=current arc length: IDM/accel only controls `v`;
+      (x, y, yaw) are re-derived from the new arc length via path.lookup, so
+      the agent's shape always matches its logged curve. Returns
+      (new_state, new_s) in this mode.
+      Two fallback cases (do not conflate): this function only ever handles
+      "path exhausted, agent still logged as valid" (hold the last known
+      heading and continue straight from the last waypoint) -- "agent's
+      valid flag goes false" is a scene-timeline fact the caller (closed_loop.py)
+      must handle by dropping the agent from the active set entirely, not by
+      calling this function at all for that agent.
+    """
     x, y, yaw, v = state
-    x_next = x + v * np.cos(yaw) * dt
-    y_next = y + v * np.sin(yaw) * dt
+    if path is None:
+        x_next = x + v * np.cos(yaw) * dt
+        y_next = y + v * np.sin(yaw) * dt
+        v_next = max(v + accel * dt, 0.0)
+        return np.array([x_next, y_next, yaw, v_next])
+
+    if s is None:
+        raise ValueError("bicycle_free: s is required when path is given")
     v_next = max(v + accel * dt, 0.0)
-    return np.array([x_next, y_next, yaw, v_next])
+    s_next = s + v * dt
+    if path.exhausted(s_next):
+        last_x, last_y, last_yaw = path.lookup(path.total_length)
+        overrun = s_next - path.total_length
+        x_next = last_x + overrun * np.cos(last_yaw)
+        y_next = last_y + overrun * np.sin(last_yaw)
+        return np.array([x_next, y_next, last_yaw, v_next]), s_next
+    x_next, y_next, yaw_next = path.lookup(s_next)
+    return np.array([x_next, y_next, yaw_next, v_next]), s_next
 
 
 # ---------------------------------------------------------------------------
