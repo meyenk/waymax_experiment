@@ -195,6 +195,46 @@ def test_agent_dropped_when_valid_flag_goes_false():
     print("valid-flag-false fallback ok: agent dropped from active set exactly at t=10")
 
 
+def test_agents_already_present_are_picked_up_at_t0():
+    """Regression: agents whose valid span started BEFORE t0 must enter the
+    active set on the first sync. An earlier version only added agents whose
+    first-valid timestep equalled t exactly, which is right for mid-scene
+    entry but silently left the sim with zero agents for any t0 > 0 -- the
+    normal case, since t0 >= hist_len-1. Part A's shape assertions didn't
+    catch it because an empty (0, 4) array still has shape[-1] == 4."""
+    scenario, ego_idx = make_fake_scenario()
+    scene_paths = build_agent_paths(scenario, ego_idx)
+    assert scene_paths["first_valid"] == {1: 0, 2: 0}, "fixture should have both agents valid from t=0"
+
+    hist_len, t0 = 10, 10
+    agents = ActiveAgentSet(scene_paths, hist_len)
+    agents.sync(scenario, t0)
+    assert agents.order == [1, 2], (
+        f"both agents are valid at t0={t0} and should be active, got {agents.order}")
+
+    # arc length must reflect distance already covered by t0, not restart at 0
+    for obj_idx in agents.order:
+        expected = scene_paths["paths"][obj_idx].cum_s[t0]
+        assert np.isclose(agents.s[obj_idx], expected), (
+            f"agent {obj_idx}: s should be the logged arc length at t0 "
+            f"({expected:.2f}m), got {agents.s[obj_idx]:.2f}m")
+
+    # history must be the real logged window, not one state tiled hist_len times
+    hist = agents.hist[1]
+    assert hist.shape == (hist_len, 4)
+    assert not np.allclose(hist, hist[0]), (
+        "a moving agent present since before t0 should have real varying history, "
+        "not a single state repeated across the window")
+
+    # and it must actually reach the closed loop, not just the agent set
+    model = Stage1Model(hidden_dim=64, future_len=30)
+    log = run_closed_loop(scenario, model, ego_idx, t0=t0, max_steps=4, dt=0.1)
+    for step, a in enumerate(log["agent_states"]):
+        assert a.shape[0] == 2, f"step {step}: expected 2 simulated agents, got {a.shape[0]}"
+    print(f"agents present before t0 ok: {agents.order} active at t0={t0}, "
+          f"s={[round(agents.s[i], 2) for i in agents.order]}, carried into the closed loop")
+
+
 def test_mid_scene_agent_entry():
     """New agents entering mid-scene: an object whose first-valid-timestep
     is not t0 should join the active set exactly when the log says it
@@ -235,5 +275,6 @@ if __name__ == "__main__":
     test_agent_follows_curving_logged_path()
     test_path_exhausted_fallback_holds_last_heading()
     test_agent_dropped_when_valid_flag_goes_false()
+    test_agents_already_present_are_picked_up_at_t0()
     test_mid_scene_agent_entry()
     print("\nall closed_loop tests passed")

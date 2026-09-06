@@ -185,10 +185,13 @@ class ActiveAgentSet:
         self.hist = {}             # obj_idx -> (hist_len, 4) world, oldest..newest
 
     def sync(self, scenario, t):
-        """Drop agents invalid at t (log fact, fallback case 2); add agents
-        whose first-valid-timestep is exactly t (well-defined even though
-        the ego/other agents may have diverged from the log, since validity
-        is purely a property of the log's own timeline)."""
+        """Drop agents the log marks invalid at t (fallback case 2); add any
+        object valid at t that isn't tracked yet. On the first sync (at t0)
+        that picks up every agent already mid-span; on later syncs it's the
+        mid-scene-entry case (an object whose span starts exactly at t).
+        Both are well-defined even though the ego/other agents may have
+        diverged from the log, since validity is purely a property of the
+        log's own timeline."""
         traj = scenario.log_trajectory
         valid_t = np.array(traj.valid[:, t])
 
@@ -198,15 +201,33 @@ class ActiveAgentSet:
                 del self.s[obj_idx], self.state[obj_idx], self.hist[obj_idx]
 
         for obj_idx, t_first in self.scene_paths["first_valid"].items():
-            if t_first == t and obj_idx not in self.s:
-                state0 = _agent_world_state(scenario, obj_idx, t)
-                self.order.append(obj_idx)
-                self.s[obj_idx] = 0.0
-                self.state[obj_idx] = state0
-                # no real history yet -- backfill the buffer by holding this
-                # single known state across the whole window, consistent
-                # with how padding/invalid slots are treated elsewhere.
-                self.hist[obj_idx] = np.tile(state0, (self.hist_len, 1))
+            if obj_idx in self.s or not valid_t[obj_idx]:
+                continue
+            self._add(scenario, obj_idx, t, t_first)
+
+    def _add(self, scenario, obj_idx, t, t_first):
+        """Start tracking obj_idx from real time t. Its arc length starts at
+        however far along its cached path the log says it already is (0 for a
+        fresh mid-scene entrant, non-zero for one that's been driving since
+        before t)."""
+        path = self.scene_paths["paths"][obj_idx]
+        offset = int(np.clip(t - t_first, 0, len(path.cum_s) - 1))
+        self.order.append(obj_idx)
+        self.s[obj_idx] = float(path.cum_s[offset])
+        self.state[obj_idx] = _agent_world_state(scenario, obj_idx, t)
+        self.hist[obj_idx] = self._log_history(scenario, obj_idx, t, t_first)
+
+    def _log_history(self, scenario, obj_idx, t, t_first):
+        """(hist_len, 4) world history over [t-hist_len+1, t] read from the
+        log -- correct here because an agent is only ever added at the moment
+        we start simulating it, so nothing before that has diverged. Window
+        entries earlier than the object's first valid timestep repeat its
+        first known state (there's nothing real to put there); for a fresh
+        mid-scene entrant that degenerates to holding one state across the
+        whole window, as before."""
+        rows = [_agent_world_state(scenario, obj_idx, max(tau, t_first))
+                for tau in range(t - self.hist_len + 1, t + 1)]
+        return np.stack(rows, axis=0)
 
     def is_empty(self):
         return len(self.order) == 0
