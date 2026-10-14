@@ -61,15 +61,9 @@ training times reasonable while things are still being worked out. Worth
 keeping in mind when looking at any numbers here, they're not yet from the
 full dataset.
 
-The latest retrain (10 epochs, `weights/stage1_weights_tau.pth`) lands at
-test loss=1.07, ADE=0.82m, FDE=2.07m over the 3s prediction horizon. Val loss
-plateaus around epoch 4-8 and ticks back up slightly by epoch 9 -- a mild
-overfit/plateau signal, not a "needs way more data" one. The model still
-shows a general bias toward continuing the ego's current motion rather than
-committing to a maneuver change (most visible on turns, but not
-turn-specific) -- under investigation, likely some mix of maneuver-scenarios
-being a minority of the training distribution and the single-trajectory MSE
-decoder structurally hedging under ambiguity.
+A retrain against these updated (time-matched) features has been run
+(`weights/stage1_weights_tau.pth`). Results are still being looked into
+before drawing conclusions from them, so not detailed here yet.
 
 ## Stage 2: closed-loop MPC planner
 
@@ -86,23 +80,30 @@ dynamics instead of replaying the log.
 
 Status: implemented and unit-tested against synthetic scenarios (see
 `tests/`), architecturally compatible with the retrained encoder (no code
-changes needed to use `stage1_weights_tau.pth`), but not yet run end-to-end
-against a real Waymax scenario -- that verification is still pending.
+changes needed to use `stage1_weights_tau.pth`). Now also run against real
+Waymax scenarios, which surfaced two issues currently being worked through
+before the results are worth trusting:
+
+- A design assumption behind the path-following agents (each object appears,
+  drives, and disappears exactly once) doesn't hold on most real scenarios --
+  real validity masks have gaps (occlusion/tracker dropouts), which the code
+  currently refuses to guess about rather than silently mishandling.
+- The planner's cost function needs calibration -- isolated testing shows it
+  currently rewards covering distance over matching the reference's pace,
+  which compounds badly across many replanning steps.
 
 ## What this could become
 
 The closed-loop planner above is the "combine with a proper planner" step
-this section used to describe as future work -- now built, pending real-data
-verification. From here:
+this section used to describe as future work -- now built, being debugged
+against real data. From here:
 
-- Confirm the closed-loop actually runs sensibly on a real scenario, and see
-  how much the encoder's "keep doing the current thing" bias actually hurts
-  it in practice (MPC's cone is anchored to the reference, so a bad
-  reference constrains how far it can correct).
-- A cheap diagnostic before reaching for bigger changes: mask out the
-  agent/map/light branches at inference and see how much the prediction
-  actually changes -- tells us whether the model is using scene context at
-  all, or substantially just extrapolating its own current speed/heading.
+- Settle how the path-following agents should handle real (gappy) validity
+  data, then recalibrate the planner's cost function against real scenarios.
+- A cheap diagnostic worth running alongside that: mask out the agent/map/
+  light branches at inference and see how much the prediction actually
+  changes -- tells us whether the model is using scene context at all, or
+  substantially just extrapolating its own current speed/heading.
 - There's also more to explore around the "only pay attention to a few
   things" idea itself, being more selective about which agents actually
   matter, tied to where the car is actually headed, rather than looking at
