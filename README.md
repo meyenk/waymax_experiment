@@ -1,211 +1,209 @@
 # Waymax Experiments
 
-This project is about learning how a self driving car might understand the
-world around it and predict where it will go next.
+This project is about how a self-driving car might understand the world
+around it and decide where to go next.
 
-The starting idea was pretty simple: when we drive, we don't pay attention to
-everything around us. We only really track a handful of things that matter,
-and we often already know where we're headed (like a turn coming up) well
-before we get there. The goal here was to try building something along those
-lines, where a model learns to focus on the agents and parts of the scene
-that actually matter, instead of treating everything around it as equally
-important.
-
-## What exists right now
-
-A model that looks at a driving scene (nearby cars, the road layout, traffic
-lights) from the car's own frame of reference, and predicts the car's future
-trajectory.
-
-The architecture has three encoder branches:
-
-- Agents (everything except the ego car): each one gets a short history
-  window of position, heading, and velocity, run through its own GRU, plus
-  an embedding for its object class (vehicle, pedestrian, cyclist).
-- Static map points (lane markings, stop signs, crosswalks): passed through
-  an MLP, each point's type also gets its own learned embedding, since these
-  don't move over time so there's no need for a GRU here.
-- Traffic lights: same idea as agents, a GRU over history, since light state
-  changes over time, plus an embedding for the current state.
-
-Each branch pools its items (agents, map points, or lights) into one vector
-using a softmax over a learned relevance score per item, instead of a plain
-average. This is the main design choice in the project: the model decides
-how much to weight each surrounding car or map point rather than treating
-all of them as equally important, and padded/invalid slots get a weight of
-exactly zero through the softmax's minus infinity trick.
-
-The three pooled vectors are concatenated together with the ego car's own
-current yaw and speed, and this combined vector is passed through a decoder
-MLP that outputs the predicted future trajectory directly.
-
-What goes into each branch is a region of interest around the car at the
-moment of the decision (`src/features.py`, shared by training and the
-closed loop so they can't drift apart):
-
-- agents: everyone visible right now within 50 m, nearest 32. If the
-  tracker lost an agent for a few frames within its 1 s history (occlusion
-  happens a lot in real logs), those frames are interpolated and flagged
-  with an extra "observed" feature, instead of dropping the agent entirely.
-- map: every roadgraph point within 80 m, nearest first.
-- traffic lights: visible now, within 80 m, nearest first.
-
-Everything (positions, velocities, map points, light positions) is
-transformed into the ego car's own coordinate frame before being fed in,
-since what matters for driving is where something is relative to you, not
-its position in some arbitrary global frame. As of the latest retrain, this
-transform is time-matched (each historical instant uses the ego's own state
-*at that instant*, not its state right now) rather than anchoring the whole
-history window to a single current-instant pose -- matters most for
-velocity, and mostly during turns/braking (see `src/transforms.py`).
+The starting idea: when we drive, we don't pay attention to everything
+around us. We track a handful of things that matter, and we usually know
+where we're headed well before we get there. The goal is a model that learns
+to focus on the agents and parts of the scene that matter, instead of
+treating everything equally.
 
 It's trained and tested on real driving logs from the Waymo Open Motion
-Dataset, using the Waymax simulator. There are some visualizations too, the
-real driving clip alongside what the model predicted, so it's easy to see how
-it's actually doing rather than just looking at a loss number.
+Dataset (WOMD), using the Waymax simulator.
 
-![Visualisation of learned trajectory](unknown.png)
+## Where this started: prediction only
 
-A note on scale: the full dataset has hundreds of thousands of scenarios, and
-what's been run so far only uses a portion of it, capped mainly to keep
-training times reasonable while things are still being worked out. Worth
-keeping in mind when looking at any numbers here, they're not yet from the
-full dataset.
+The first version was a pure prediction model. Given the last second of a
+scene (nearby cars, the road layout, traffic lights), it predicts where the
+ego car will be over the next 3 seconds.
 
-### Retrain with bug fixes
+The model has three encoder branches:
 
-Task 2 fixed how the history features were computed: an agent's velocity
-at each past moment was being compared against the ego's velocity *now*,
-not at that same moment, which mixed the ego's own acceleration into every
-agent's features (worst during turns and braking). Going through the
-retraining for that turned up more issues with what the model was being
-fed:
+- **Agents**: a GRU over each agent's recent history, plus its class
+  (vehicle, pedestrian, cyclist).
+- **Map**: road points (lane lines, crosswalks, stop signs) through a small
+  MLP, plus their type.
+- **Traffic lights**: a GRU over each light's recent states.
 
-- agents had to be visible in every one of the 10 history frames, so any
-  tracker dropout removed them completely, and there was no distance filter
-  or ranking at all;
-- the map branch got the first 200 points within 80 m in array order,
-  essentially an arbitrary subset of the road;
-- the data loader was capped at 32 objects, which Waymax applies in file
-  order -- so nearby cars could be cut, and when the ego itself was cut,
-  some other object was silently treated as the ego.
+Each branch combines its items with a learned relevance weight per item
+instead of a plain average. This is the "pay attention to what matters"
+part. The three summaries plus the ego's speed go through a decoder that
+outputs the 3 s trajectory. Everything is expressed relative to the ego car.
 
-The training run itself also had problems: the learning rate schedule was
-set up for 5 epochs but ran for 10 (so the LR climbed back up for the last
-few epochs), and test numbers came from the last epoch instead of the saved
-best checkpoint.
+That model implicitly learned where the car goes given what everyone else is
+doing. But its predictions were just predictions: nothing happened as a
+consequence of them. The car never actually drove, and nobody reacted to it.
 
-All of these are fixed on the `meeting-prep` branch, and the model is
-retrained from scratch with them (`notebooks/Av2_retrain_meeting_prep.ipynb`).
-Since the earlier models were trained on partly wrong inputs, their ADE/FDE
-aren't compared against here -- these numbers are the new baseline.
+## What changed since
 
-<!-- RESULTS: paste the table printed at the end of Av2_retrain_meeting_prep.ipynb here -->
-_Results pending: this run hasn't been done yet._
+### 1. Correct relative velocities
 
-The same notebook also runs a branch ablation (hide agents / map / lights
-at inference and see how much the prediction changes), to check whether the
-model actually uses the scene or mostly extrapolates its own speed.
+Each past frame of an agent's history was measured against where the ego is
+*now*, not where the ego was *at that frame*. For velocity this mixes two
+moments in time, so the ego's own braking or turning leaked into every
+agent's features. Now every past frame is measured against the ego's state
+at that same moment (`src/transforms.py`).
 
-## Stage 2: closed-loop MPC planner
+### 2. What the model looks at
 
-On top of the Stage 1 encoder, `src/dynamics.py` + `src/mpc.py` +
-`src/closed_loop.py` add a receding-horizon planner: the encoder's predicted
-trajectory becomes a reference, `mpc.py` samples cone-constrained candidate
-control sequences around it, scores them against a collision/progress/
-comfort cost (with other agents projected forward via IDM car-following,
-each one path-following its own logged route's curvature rather than a
-frozen heading), and executes the first control of whichever candidate wins
-before replanning from the new real state. `closed_loop.py` wires this into
-a real per-step simulation where both the ego and other agents run their own
-dynamics instead of replaying the log.
+Going through the data for the retrain turned up problems with what the
+model was being fed. The selection now lives in one place
+(`src/features.py`), shared by training and the closed loop:
 
-Status: implemented and unit-tested against synthetic scenarios (see
-`tests/`). The first runs against real Waymax scenarios
-(`Av2_closed_loop.ipynb`) surfaced two issues, both addressed on the
-`meeting-prep` branch:
+| | before | now |
+|---|---|---|
+| agents | had to be tracked in all 10 history frames, any distance, first 32 in file order | visible now, within 50 m, nearest 32 |
+| tracking dropouts | agent dropped entirely | short gaps interpolated and flagged as "filled in" |
+| map | first 200 points within 80 m, in file order | every point within 80 m, nearest first |
 
-- The path-following agents assumed each object appears, drives and
-  disappears exactly once. On real data 95% of scenarios have at least one
-  object that drops out for a few frames and comes back, and the code
-  refused those scenarios, leaving 2 usable out of 60. Now gaps of up to
-  1 s are bridged (the agent stays in the sim, its path interpolated) and
-  longer gaps split the object into separate appearances.
-- The planner's cost rewarded covering distance in any direction, so with
-  nothing else pulling on speed it sped up (18 m/s while the human was
-  nearly stopped). There's now an opt-in calibrated cost (progress measured
-  along the heading, plus a penalty on deviating from the reference's
-  speed). It's run side by side with the original in
-  `notebooks/Av2_closed_loop_meeting_prep.ipynb`. It's a first calibration,
-  not a tuned one.
+On 150 validation scenes:
 
-Also: every agent is still simulated, but only those within 50 m enter the
-planner's candidate rollouts, and the model sees the same region-of-interest
-selection as in training.
+- In 65% of decision moments, the old rule threw away at least one nearby
+  agent because of a short tracking dropout.
+- The old rule also fed about 6 agents per moment from more than 50 m away.
+- The map within 80 m holds about 6,400 points (median), so 200 points in
+  file order was an arbitrary slice of the road.
 
-<!-- RESULTS: closed-loop summary table from Av2_closed_loop_meeting_prep.ipynb -->
-_Results pending._
+![What the model is fed](figures/selection.png)
 
-## What this could become
+*Left: coloured map points and orange agents are what the model gets. Red
+rings are agents the old rule dropped, grey crosses are far agents the old
+rule fed instead. Right: the agent input exactly as the model sees it.*
 
-The closed-loop planner above is the "combine with a proper planner" step
-this section used to describe as future work -- now built, being debugged
-against real data. From here:
+The training setup also had a learning-rate schedule bug (set for 5 epochs
+but run for 10) and reported test numbers from the last epoch rather than
+the saved best checkpoint. Both are fixed.
 
-- Depending on what the ablation shows: if the model barely uses the
-  scene, look at what it's missing first -- it currently gets the ego's
-  current speed only (no ego history, acceleration or yaw rate) and no idea
-  of where the car is headed (route/goal).
-- Predict several possible futures instead of one. A single MSE-trained
-  trajectory averages between options (turn vs go straight) and lands in
-  between, which is consistent with the "keeps doing what it's doing" bias.
-  A distribution would also give the planner something principled to sample
-  from.
-- On the planner side: time-correlated sampling noise (smoother candidates
-  than independent per-step noise), warm-starting from the previous step's
-  plan, and proper cost tuning.
-- Possibly compare against Waymax's own built-in IDM agents and metrics
-  (off-road, overlap, log divergence) instead of only our own.
-- The agent region of interest is a fixed 50 m for now; making it depend on
-  speed (or on where the car is headed) is an easy next step.
-- There's also more to explore around the "only pay attention to a few
-  things" idea itself, being more selective about which agents actually
-  matter, tied to where the car is actually headed, rather than looking at
-  everyone nearby all the time -- deliberately deferred until the
-  closed-loop planner above is confirmed working end-to-end.
+### 3. Retrained model
 
+Retrained from scratch with all of the above (10 epochs, 2,000 training
+scenarios, `notebooks/Av2_retrain_meeting_prep.ipynb`). Since the old models
+were trained on partly wrong inputs, these numbers are a new baseline rather
+than a comparison.
 
+| test set (300 scenarios) | ADE (m) | FDE (m) |
+|---|---|---|
+| all | 0.66 | 1.78 |
+| straight | 0.56 | 1.52 |
+| turning | 1.22 | 3.39 |
+
+![Training curves](figures/training_curves.png)
+
+Validation error was still improving at the last epoch, so more data or
+epochs should help further.
+
+![Predictions on a turn](figures/turn_snapshots.png)
+
+*Green: what the human did. Red dashed: the model's prediction.*
+
+To check whether the model actually uses the scene, each branch was hidden
+at test time:
+
+| hidden | ADE change |
+|---|---|
+| agents | +62% |
+| traffic lights | +13% |
+| map | +5% |
+| everything | +89% |
+
+So the model relies heavily on other agents and on traffic lights, but
+hardly on the map. Turns are where it struggles most, which is where the
+map should matter most. Improving how the map is encoded is the obvious
+next step for the model.
+
+## Closed loop: the pipeline now exists
+
+The next step was letting the car actually drive, so that its decisions have
+consequences. Every 0.1 s:
+
+1. The model predicts the next 3 s from the current scene.
+2. The planner treats that prediction as a reference path. It samples
+   variations of it, kept inside a cone that widens from 1 m at the first
+   step to 10 m at the last.
+3. Each candidate is scored on collisions, progress and comfort, with the
+   other cars reacting to it.
+4. The car executes only the first step of the best candidate, and the
+   whole thing repeats from where it actually ended up.
+
+The other cars follow their own logged paths, but their speed is controlled
+by a car-following model (IDM), so they brake if the ego cuts in front or
+slows down ahead of them. The ego itself follows a kinematic bicycle model.
+
+Running this on real scenes first hit the dropout problem: 94% of scenarios
+have at least one car that disappears for a few frames, which the agent
+simulation couldn't handle. Gaps up to 1 s are now bridged by interpolating
+the car's path; longer gaps are treated as the car leaving and coming back.
+Most gaps turned out to be a single frame. Every scenario now runs.
+
+![Closed-loop rollouts](figures/closed_loop_paths.png)
+
+*Six real scenes, 4 s each. Green: the human. Blue dashed: our planner. Thin
+red: the model's prediction every 0.5 s. Top row: original cost. Bottom row:
+a calibrated cost that also tracks the predicted speed.*
+
+The pipeline runs end to end, with no collisions in these runs, but the
+driving isn't right yet:
+
+- In most runs the car turns in tight circles.
+- In one run it keeps accelerating, to about 50 m/s.
+
+Both trace back to the planner rather than the model. It turns the first
+predicted point (0.1 s ahead) directly into a steering command, and nothing
+limits steering or acceleration. At low speed, a 5 cm error in that first
+point becomes a 73 degree steering angle. Changing the cost function alone
+made no measurable difference, which is why the next work is on the planner
+itself.
+
+![Speed and divergence](figures/closed_loop_speed.png)
+
+## Next steps
+
+- **Planner**: limit steering and acceleration, steer towards a point
+  further ahead instead of the first one, then tune the cost function.
+- **Sampling**: smoother candidates (noise that's correlated over time
+  rather than independent each step), and starting each step from the
+  previous plan instead of from scratch.
+- **Model**: a better map encoding (lanes as polylines rather than one
+  pooled vector), the ego's own recent motion as an input, and where the
+  car is headed (route).
+- **Multiple futures**: predict a few possible trajectories instead of one,
+  so the planner has a real distribution to sample from.
+- **Region of interest**: fixed at 50 m for now; could depend on speed.
+
+## Running it
+
+Both notebooks run on Colab (Waymax data access is easiest there) and
+include their outputs:
+
+- `notebooks/Av2_retrain_meeting_prep.ipynb`: data checks, training,
+  test results, branch ablation.
+- `notebooks/Av2_closed_loop_meeting_prep.ipynb`: closed loop on real
+  scenes.
+
+Unit tests (no Waymax needed): `python -m tests.test_features`,
+`tests.test_transforms`, `tests.test_mpc`, `tests.test_closed_loop`.
 
 ## Repo layout
 
 ```
 src/
-  features.py      what the model sees: ROI selection, dropout filling (shared)
-  transforms.py    ego frame conversions (time-matched/tau, see above)
-  model.py         the Stage 1 model itself
-  extract.py       pulls one training example out of a scenario
-  dataset.py       splits data into train, val, test
-  train.py         the training loop
-  visualize.py     playback and prediction plots
+  features.py      what the model sees: region of interest, dropout filling
+  transforms.py    ego-frame conversions
+  model.py         the prediction model
+  extract.py       builds one training example from a scenario
+  dataset.py       train / val / test split
+  train.py         training loop, branch ablation
+  visualize.py     plots, including what the model is fed
   metrics.py       ADE, FDE
-  dynamics.py      kinematic bicycle model (Stage 2)
-  mpc.py           cone-constrained MPC + IDM car-following (Stage 2)
-  closed_loop.py   wires encoder -> MPC -> dynamics into a real rollout (Stage 2)
-tests/
-  test_mpc.py            dynamics/mpc unit tests, synthetic data
-  test_closed_loop.py    closed-loop wiring + path-following agent tests
-  test_transforms.py     time-matched (tau) vs decision-instant (t) regression test
-  test_features.py       ROI selection, dropout filling, map selection
-notebooks/
-  Av2_retrain_meeting_prep.ipynb       retrain with bug fixes + diagnostics + ablation (Colab)
-  Av2_closed_loop_meeting_prep.ipynb   closed loop on real scenarios, both costs (Colab)
+  dynamics.py      kinematic bicycle model
+  mpc.py           planner: sampling, IDM agents, cost
+  closed_loop.py   model + planner + agents, stepped together
+tests/             unit tests on synthetic scenes
+notebooks/         the two Colab notebooks above, with outputs
+figures/           figures used in this README
 weights/
-  stage1_weights.pth        pre-tau baseline (old selection, 6 agent features)
-  best_weights_v2.pth       pre-tau baseline, best-of-run (old selection, 6 agent features)
-  stage1_weights_tau.pth    first tau retrain (old selection, 6 agent features)
-  stage1_weights_roi.pth    produced by Av2_retrain_meeting_prep.ipynb -- current
+  stage1_weights_roi.pth    current model
+  stage1_weights.pth, best_weights_v2.pth, stage1_weights_tau.pth
+                            older models, trained on the old inputs
 ```
-
-The three older checkpoints were trained with 6 agent features; load them
-with `Stage1Model(agent_feat_dim=6)`. They don't match the current feature
-extraction, so they're kept as a record rather than for use.
