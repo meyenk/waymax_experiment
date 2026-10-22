@@ -16,11 +16,13 @@ Supersedes the banner below where they disagree.
   first 200 in array order); `max_num_objects=128` (32 could cut the SDC).
   The 7th feature means a retrain, and the old checkpoints need
   `Stage1Model(agent_feat_dim=6)`.
-- **The Aug 22 retrain numbers below are not a fair comparison** (LR schedule
+- **The Aug 22 retrain numbers below are superseded** (LR schedule
   `T_max=5` over 10 epochs, test on the last epoch rather than the best
-  checkpoint, different setup from the pre-tau run).
-  `notebooks/Av2_retrain_meeting_prep.ipynb` retrains tau and t side by side
-  under identical conditions, plus a branch ablation.
+  checkpoint, plus the input bugs above).
+  `notebooks/Av2_retrain_meeting_prep.ipynb` retrains with all fixes
+  (time-matched features only -- no t-anchored comparison, decided with the
+  repo owner: the fixes are corrections, so the result is a new baseline),
+  plus a branch ablation.
 - The "flag, don't handle" instruction for gappy validity masks (Part B,
   Task 1) is resolved by the above, decided with the repo owner.
 

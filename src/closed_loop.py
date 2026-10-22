@@ -324,7 +324,7 @@ def get_light_window_world(scenario, t, hist_len, ego_xy=None):
 def build_model_batch(agent_hist_world, agent_cls, map_xy_world, map_types,
                        light_hist_world_xy, light_state,
                        ego_hist_xy, ego_hist_yaw, ego_hist_vxvy,
-                       agent_hist_obs=None, time_matched=True, return_selection=False):
+                       agent_hist_obs=None, return_selection=False):
     """All *_world inputs are plain numpy in world frame; returns a batch
     dict of torch tensors (batch size 1) in the model's expected ego-local
     frame, built through the SAME features.py selection as training.
@@ -338,8 +338,6 @@ def build_model_batch(agent_hist_world, agent_cls, map_xy_world, map_types,
     -- the ego's own state at EACH individual historical instant tau (Part B,
     task 2). The caller is responsible for the tau<t0 fallback (use the log
     there, since the ego hadn't diverged from it yet) -- see run_closed_loop.
-    time_matched=False reproduces the pre-Task-2 features (must match how the
-    loaded checkpoint was trained).
 
     return_selection=True also returns a dict with the chosen agent rows
     ("agent_rows", indices into agent_hist_world) and map stats, for logging
@@ -362,7 +360,7 @@ def build_model_batch(agent_hist_world, agent_cls, map_xy_world, map_types,
     sel = agent_hist_world[rows]
     vxvy = np.stack([sel[..., 3] * np.cos(sel[..., 2]), sel[..., 3] * np.sin(sel[..., 2])], axis=-1)
     agent_feats = F.agent_features(sel[..., :2], sel[..., 2], vxvy, agent_hist_obs[rows],
-                                   ego_hist_xy, ego_hist_yaw, ego_hist_vxvy, time_matched=time_matched)
+                                   ego_hist_xy, ego_hist_yaw, ego_hist_vxvy)
     agent_hist, agent_mask = F.pad(agent_feats, F.MAX_AGENTS)
     agent_class, _ = F.pad(np.asarray(agent_cls, dtype=np.int64)[rows], F.MAX_AGENTS)
 
@@ -372,13 +370,9 @@ def build_model_batch(agent_hist_world, agent_cls, map_xy_world, map_types,
     map_xy, map_mask = F.pad(map_xy_kept, F.MAX_MAP_POINTS)
     map_type, _ = F.pad(map_types_kept, F.MAX_MAP_POINTS)
 
-    # lights: same anchoring convention as agents (position only), pad
+    # lights: same time-matched (tau) convention as agents (position only), pad
     if light_hist_world_xy.shape[0] > 0:
-        if time_matched:
-            light_local = transform_positions(light_hist_world_xy, ego_hist_xy, ego_hist_yaw)
-        else:
-            light_local = transform_positions(light_hist_world_xy, ego_world_xy, ego_yaw)
-        light_local = light_local.astype(np.float32)
+        light_local = transform_positions(light_hist_world_xy, ego_hist_xy, ego_hist_yaw).astype(np.float32)
     else:
         light_local = light_hist_world_xy.astype(np.float32)
     light_hist_xy, light_mask = F.pad(light_local, F.MAX_LIGHTS)
@@ -406,7 +400,7 @@ def build_model_batch(agent_hist_world, agent_cls, map_xy_world, map_types,
 def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
                      hist_len=10, future_len=30, n_candidates=32,
                      r_min=1.0, r_max=10.0, reactive=True, device="cpu",
-                     time_matched=True, cost_kwargs=None):
+                     cost_kwargs=None):
     """Returns a dict with per-step logs: ego_states (list of (4,) world),
     agent_states (list of (N,4) world, every active agent), agent_ids (list
     of (N,) object indices matching agent_states row-for-row),
@@ -466,7 +460,7 @@ def run_closed_loop(scenario, model, ego_idx, t0, max_steps=20, dt=0.1,
         batch, sel = build_model_batch(
             agents.hist_array(), agents.cls_array(), map_xy_world, map_types,
             light_hist_xy, light_state, ego_hist_xy, ego_hist_yaw, ego_hist_vxvy,
-            agent_hist_obs=agents.hist_obs_array(), time_matched=time_matched, return_selection=True)
+            agent_hist_obs=agents.hist_obs_array(), return_selection=True)
         batch = {k: v.to(device) for k, v in batch.items()}
 
         with torch.no_grad():

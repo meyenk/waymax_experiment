@@ -243,8 +243,7 @@ def selection_report(scenarios, hist_len=10, future_len=30, stride=10):
     return {k: (np.array(v) if isinstance(v, list) else v) for k, v in out.items()}
 
 
-def plot_selection(scenario, t, model=None, hist_len=10, time_matched=True,
-                   device="cpu", window=None):
+def plot_selection(scenario, t, model=None, hist_len=10, device="cpu", window=None):
     """Two panels for one decision instant t.
     Left, world frame: all roadgraph points (light grey), map points the
     model is fed (coloured), agent ROI circle (dashed) and map radius
@@ -260,7 +259,7 @@ def plot_selection(scenario, t, model=None, hist_len=10, time_matched=True,
     ego_idx = int(np.argmax(np.array(scenario.object_metadata.is_sdc)))
     traj = scenario.log_trajectory
     window = window or F.MAP_RADIUS + 10.0
-    ex = extract_example(scenario, ego_idx, t, hist_len, time_matched=time_matched)
+    ex = extract_example(scenario, ego_idx, t, hist_len)
     if ex is None:
         print(f"t={t}: no valid example (needs {hist_len} frames of history and a full future)")
         return
@@ -344,8 +343,7 @@ def plot_selection(scenario, t, model=None, hist_len=10, time_matched=True,
     ax2.set_xlim(-w2, w2); ax2.set_ylim(-w2, w2)
     ax2.set_aspect("equal")
     ax2.set_title("ego frame: agent history tensor as fed to the model\n"
-                  + ("(time-matched: frame tau is relative to the ego AT tau, so trails "
-                     "show relative motion, not world paths)" if time_matched else "(t-anchored)"),
-                  fontsize=9)
+                  "(time-matched: frame tau is relative to the ego AT tau, so trails "
+                  "show relative motion, not world paths)", fontsize=9)
     plt.tight_layout()
     plt.show()

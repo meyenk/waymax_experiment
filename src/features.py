@@ -127,20 +127,13 @@ def bridge_short_gaps(valid, max_gap):
 # ---------------------------------------------------------------------------
 
 def agent_features(hist_xy, hist_yaw, hist_vxvy, observed,
-                   ego_hist_xy, ego_hist_yaw, ego_hist_vxvy, time_matched=True):
+                   ego_hist_xy, ego_hist_yaw, ego_hist_vxvy):
     """All world frame. hist_*: (N, T, ...) agents, ego_hist_*: (T, ...).
-    time_matched=True (Task 2 / tau): history frame tau is expressed relative
-    to the ego's own state at tau. time_matched=False (pre-Task-2 / t): every
-    frame uses the ego's state at the current instant (the window's last
-    entry) -- kept only so the before/after-Task-2 comparison can be rerun
-    on identical code. Returns (N, T, AGENT_FEAT_DIM) float32."""
-    if time_matched:
-        ref_xy, ref_yaw, ref_v = ego_hist_xy, ego_hist_yaw, ego_hist_vxvy
-    else:
-        ref_xy, ref_yaw, ref_v = ego_hist_xy[-1], float(ego_hist_yaw[-1]), ego_hist_vxvy[-1]
-    xy = transform_positions(hist_xy, ref_xy, ref_yaw)
-    yaw = transform_yaw(hist_yaw, ref_yaw)
-    v_rel = transform_velocities(hist_vxvy, ref_v, ref_yaw)
+    Time-matched (Task 2 / tau): history frame tau is expressed relative to
+    the ego's own state at tau. Returns (N, T, AGENT_FEAT_DIM) float32."""
+    xy = transform_positions(hist_xy, ego_hist_xy, ego_hist_yaw)
+    yaw = transform_yaw(hist_yaw, ego_hist_yaw)
+    v_rel = transform_velocities(hist_vxvy, ego_hist_vxvy, ego_hist_yaw)
     return np.concatenate(
         [xy, np.cos(yaw)[..., None], np.sin(yaw)[..., None], v_rel,
          np.asarray(observed, dtype=float)[..., None]], axis=-1).astype(np.float32)

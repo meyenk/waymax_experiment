@@ -1,12 +1,6 @@
 """
 Training loop over a stream of Waymax scenarios. Visualization lives in
 src/visualize.py -- kept separate so it's easy to find/iterate on independently.
-
-run_epoch_variants trains/evaluates several model variants on the SAME
-scenarios in the SAME order -- each variant only differs in how features
-are computed (e.g. time_matched=True vs False for the before/after-Task-2
-comparison). Data loading is shared, so a fair A/B costs one data pass, not
-two. run_epoch is the original single-model API, kept as a thin wrapper.
 """
 
 import time
@@ -34,7 +28,7 @@ def get_ego_idx(scenario):
     return int(np.argmax(is_sdc)) if is_sdc.any() else None
 
 
-def build_examples_from_scenario(scenario, hist_len=10, future_len=30, stride=10, time_matched=True):
+def build_examples_from_scenario(scenario, hist_len=10, future_len=30, stride=10):
     """All valid (ego, t) examples from one scenario, given our window stride."""
     global SKIPPED_NO_SDC
     ego_idx = get_ego_idx(scenario)
@@ -43,7 +37,7 @@ def build_examples_from_scenario(scenario, hist_len=10, future_len=30, stride=10
         return []
     examples = []
     for t in get_window_starts(hist_len, future_len, stride):
-        ex = extract_example(scenario, ego_idx, t, hist_len, future_len, time_matched=time_matched)
+        ex = extract_example(scenario, ego_idx, t, hist_len, future_len)
         if ex is not None:
             examples.append(ex)
     return examples
@@ -61,87 +55,61 @@ def ablate_batch(batch, ablate):
     return batch
 
 
-def run_epoch_variants(variants, scenario_iter, max_scenarios, batch_size=16, train=True,
-                        device="cpu", grad_clip_norm=1.0, verbose_every=5, ablate=None):
-    """One pass over up to max_scenarios scenarios for every variant.
-    variants: {name: {"model": ..., "optimizer": ... (None if not training),
-    "time_matched": bool}}. Returns {name: {"loss", "ade", "fde",
-    "n_examples", "map_truncated_frac"}} where map_truncated_frac is the
-    share of examples with more map points in range than MAX_MAP_POINTS.
-    Both pred (model output) and target (from collate_examples) are absolute
-    positions in the ego frame at t -- same space, safe to compare directly."""
-    for v in variants.values():
-        v["model"].train() if train else v["model"].eval()
-    mode = "train" if train else "val"
-    buffers = {name: [] for name in variants}
-    stats = {name: {"loss": [], "ade": [], "fde": [], "n": [], "trunc": 0, "count": 0}
-             for name in variants}
+def run_epoch(model, optimizer, scenario_iter, max_scenarios, batch_size=16, train=True,
+              device="cpu", grad_clip_norm=1.0, verbose_every=5, ablate=None):
+    """One pass over up to max_scenarios scenarios. Returns a dict with mean
+    loss, ADE, FDE (weighted by batch size, so a small remainder batch
+    doesn't count as much as a full one), n_examples, and map_truncated_frac
+    -- the share of examples with more map points in range than
+    MAX_MAP_POINTS. Both pred (model output) and target (from
+    collate_examples) are absolute positions in the ego frame at t -- same
+    space, safe to compare directly. Prints a running update every
+    verbose_every batches so a long epoch isn't silent."""
+    model.train() if train else model.eval()
+    buffer, losses, ades, fdes, sizes = [], [], [], [], []
+    n_trunc = 0
     batch_count = 0
     start_time = time.time()
+    mode = "train" if train else "val"
 
-    def flush(name, chunk):
-        v, st = variants[name], stats[name]
+    def flush(chunk):
+        nonlocal batch_count, n_trunc
         batch, target = collate_examples(chunk)
         n_in_radius = batch.pop("map_n_in_radius", None)
         if n_in_radius is not None:
-            st["trunc"] += int((n_in_radius > batch["map_mask"].shape[1]).sum())
-        st["count"] += len(chunk)
-        batch = {k: t.to(device) for k, t in batch.items()}
-        batch = ablate_batch(batch, ablate)
+            n_trunc += int((n_in_radius > batch["map_mask"].shape[1]).sum())
+        batch = ablate_batch({k: v.to(device) for k, v in batch.items()}, ablate)
         target = target.to(device)
         if train:
-            v["optimizer"].zero_grad()
-            pred, _ = v["model"](batch)
+            optimizer.zero_grad()
+            pred, _ = model(batch)
             loss = torch.mean((pred - target) ** 2)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(v["model"].parameters(), grad_clip_norm)
-            v["optimizer"].step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            optimizer.step()
         else:
             with torch.no_grad():
-                pred, _ = v["model"](batch)
+                pred, _ = model(batch)
                 loss = torch.mean((pred - target) ** 2)
         ade, fde = compute_ade_fde(pred.detach(), target)
-        st["loss"].append(loss.item()); st["ade"].append(ade); st["fde"].append(fde)
-        st["n"].append(len(chunk))
-        return loss.item(), ade, fde
+        losses.append(loss.item()); ades.append(ade); fdes.append(fde); sizes.append(len(chunk))
+        batch_count += 1
+        if verbose_every and batch_count % verbose_every == 0:
+            elapsed = time.time() - start_time
+            print(f"    [{mode}] batch {batch_count} | loss={loss.item():.3f} "
+                  f"ade={ade:.3f} fde={fde:.3f} | {elapsed:.0f}s elapsed")
 
     for i, scenario in enumerate(scenario_iter):
         if i >= max_scenarios:
             break
-        for name, v in variants.items():
-            buffers[name].extend(build_examples_from_scenario(scenario, time_matched=v["time_matched"]))
-        while all(len(b) >= batch_size for b in buffers.values()):
-            msgs = []
-            for name in variants:
-                chunk, buffers[name] = buffers[name][:batch_size], buffers[name][batch_size:]
-                loss, ade, fde = flush(name, chunk)
-                msgs.append(f"{name}: loss={loss:.3f} ade={ade:.3f} fde={fde:.3f}")
-            batch_count += 1
-            if verbose_every and batch_count % verbose_every == 0:
-                print(f"    [{mode}] batch {batch_count} | " + " | ".join(msgs)
-                      + f" | {time.time() - start_time:.0f}s elapsed")
-    for name in variants:  # remainder
-        if buffers[name]:
-            flush(name, buffers[name])
+        buffer.extend(build_examples_from_scenario(scenario))
+        while len(buffer) >= batch_size:
+            chunk, buffer = buffer[:batch_size], buffer[batch_size:]
+            flush(chunk)
+    if buffer:  # remainder
+        flush(buffer)
 
-    out = {}
-    for name, st in stats.items():
-        n = np.array(st["n"], dtype=float)
-        wmean = (lambda xs: float(np.sum(np.array(xs) * n) / n.sum())) if n.size else (lambda xs: float("nan"))
-        out[name] = {"loss": wmean(st["loss"]), "ade": wmean(st["ade"]), "fde": wmean(st["fde"]),
-                     "n_examples": int(n.sum()),
-                     "map_truncated_frac": st["trunc"] / max(st["count"], 1)}
-    return out
-
-
-def run_epoch(model, optimizer, scenario_iter, max_scenarios, batch_size=16, train=True,
-              device="cpu", grad_clip_norm=1.0, verbose_every=5, time_matched=True, ablate=None):
-    """One pass over up to max_scenarios scenarios. Returns a dict with mean
-    loss, ADE, and FDE (now weighted by batch size, so a small remainder
-    batch no longer counts as much as a full one). Single-model wrapper
-    around run_epoch_variants, same signature as before."""
-    res = run_epoch_variants(
-        {"model": {"model": model, "optimizer": optimizer, "time_matched": time_matched}},
-        scenario_iter, max_scenarios, batch_size=batch_size, train=train, device=device,
-        grad_clip_norm=grad_clip_norm, verbose_every=verbose_every, ablate=ablate)
-    return res["model"]
+    n = np.array(sizes, dtype=float)
+    wmean = lambda xs: float(np.dot(xs, n) / n.sum()) if n.size else float("nan")
+    return {"loss": wmean(losses), "ade": wmean(ades), "fde": wmean(fdes),
+            "n_examples": int(n.sum()), "map_truncated_frac": n_trunc / max(n.sum(), 1)}

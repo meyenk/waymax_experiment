@@ -55,13 +55,11 @@ def select_agents(scenario, ego_idx, t):
     return cand[F.nearest_within(dist, F.AGENT_RADIUS, F.MAX_AGENTS)]
 
 
-def extract_agents(scenario, ego_idx, t, hist_len=10, time_matched=True):
+def extract_agents(scenario, ego_idx, t, hist_len=10):
     """Non-ego agents in the region of interest at t (see select_agents),
     history window [t-hist_len+1, t] with tracker dropouts filled in and
-    flagged (features.py). time_matched=True: each historical instant is
-    expressed relative to the ego's own state at that same instant (Part B,
-    task 2); False reproduces the pre-Task-2 (t-anchored) features, for the
-    before/after comparison only.
+    flagged (features.py). Each historical instant is expressed relative to
+    the ego's own state at that same instant (Part B, task 2: time-matched).
     Returns hist_feats (MAX_AGENTS, hist_len, AGENT_FEAT_DIM), class_ids (MAX_AGENTS,), mask (MAX_AGENTS,)."""
     traj = scenario.log_trajectory
     t0 = t - hist_len + 1
@@ -83,7 +81,7 @@ def extract_agents(scenario, ego_idx, t, hist_len=10, time_matched=True):
                     np.array(traj.vel_x)[idx, w], np.array(traj.vel_y)[idx, w]], axis=-1)
     filled = F.fill_gaps(raw, observed, angle_channels=(2,))
     feats = F.agent_features(filled[..., :2], filled[..., 2], filled[..., 3:5], observed,
-                             ego_xy, ego_yaw, ego_vxvy, time_matched=time_matched)
+                             ego_xy, ego_yaw, ego_vxvy)
 
     # ADAPT: object_metadata.object_types field name/encoding may differ
     cls = np.array(scenario.object_metadata.object_types)[idx].astype(np.int64)
@@ -111,9 +109,9 @@ def extract_map(scenario, ego_idx, t):
     return {"xy": xy_local, "type": types, "mask": mask, "n_in_radius": n_in_radius}
 
 
-def extract_traffic_lights(scenario, ego_idx, t, hist_len=10, time_matched=True):
-    """Traffic light stop-line positions + state over history, ego frame
-    (time-matched by default, same flag as extract_agents) -- position only,
+def extract_traffic_lights(scenario, ego_idx, t, hist_len=10):
+    """Traffic light stop-line positions + state over history, time-matched
+    (tau) ego frame like extract_agents -- position only,
     lights have no yaw/velocity feature. A light is used if it's valid at t
     and within features.MAP_RADIUS, nearest-first; frames where it wasn't
     observed get state 0 (UNKNOWN) and its current position.
@@ -141,10 +139,7 @@ def extract_traffic_lights(scenario, ego_idx, t, hist_len=10, time_matched=True)
         return empty
 
     xy_world, state = F.light_window_world(tl, idx, t0, t)
-    if time_matched:
-        xy = transform_positions(xy_world, ego_xy, ego_yaw)
-    else:
-        xy = transform_positions(xy_world, ego_xy[-1], float(ego_yaw[-1]))
+    xy = transform_positions(xy_world, ego_xy, ego_yaw)
 
     hist_xy, mask = F.pad(xy.astype(np.float32), F.MAX_LIGHTS)
     state, _ = F.pad(state, F.MAX_LIGHTS)
@@ -175,16 +170,16 @@ def get_ego_vec(scenario, ego_idx, t):
     return np.array([1.0, 0.0, speed], dtype=np.float32)
 
 
-def extract_example(scenario, ego_idx, t, hist_len=10, future_len=30, time_matched=True):
+def extract_example(scenario, ego_idx, t, hist_len=10, future_len=30):
     """One full training example, or None if history/future isn't available at t."""
     target = extract_ego_target(scenario, ego_idx, t, future_len)
-    agents = extract_agents(scenario, ego_idx, t, hist_len, time_matched=time_matched)
+    agents = extract_agents(scenario, ego_idx, t, hist_len)
     if target is None or agents is None:
         return None
     return {
         "agent_hist": agents["hist"], "agent_class": agents["class"], "agent_mask": agents["mask"],
         **{f"map_{k}": v for k, v in extract_map(scenario, ego_idx, t).items()},
-        **{f"light_{k}": v for k, v in extract_traffic_lights(scenario, ego_idx, t, hist_len, time_matched).items()},
+        **{f"light_{k}": v for k, v in extract_traffic_lights(scenario, ego_idx, t, hist_len).items()},
         "ego_vec": get_ego_vec(scenario, ego_idx, t),
         "target": target,
     }

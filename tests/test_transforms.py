@@ -132,24 +132,7 @@ def test_extract_agents_uses_time_matched_velocity():
         "bug is still present")
 
 
-def test_time_matched_flag_off_reproduces_t_anchoring():
-    """time_matched=False exists only to rerun the before/after-Task-2
-    comparison on identical code: it must give the old t-anchored features,
-    i.e. a stationary agent's relative velocity is CONSTANT across the window
-    (one ego velocity subtracted everywhere), and the current frame (tau=t)
-    must agree with the time-matched version."""
-    hist_len = 5
-    scenario, ego_idx, t = make_turning_scenario(hist_len=hist_len)
-    on = extract_agents(scenario, ego_idx, t, hist_len=hist_len, time_matched=True)["hist"][0]
-    off = extract_agents(scenario, ego_idx, t, hist_len=hist_len, time_matched=False)["hist"][0]
-    assert np.allclose(off[:, 4:6], off[0, 4:6]), "t-anchored v_rel of a stationary agent should be constant"
-    assert np.allclose(on[-1], off[-1]), "both conventions must agree at the current instant"
-    assert not np.allclose(on, off), "the two conventions should differ over the window under a sharp turn"
-    print("time_matched=False reproduces the t-anchored features; agrees with tau at tau=t")
-
-
 if __name__ == "__main__":
     test_windowed_vs_single_reference_differ_under_ego_turn()
     test_extract_agents_uses_time_matched_velocity()
-    test_time_matched_flag_off_reproduces_t_anchoring()
     print("\nall transform/time-matching tests passed")

@@ -72,14 +72,14 @@ training times reasonable while things are still being worked out. Worth
 keeping in mind when looking at any numbers here, they're not yet from the
 full dataset.
 
-### Retrain: before vs after Task 2, under identical conditions
+### Retrain with bug fixes
 
-The first retrain after Task 2 (`weights/stage1_weights_tau.pth`) couldn't be
-compared cleanly with the earlier model: different epoch counts, a learning
-rate schedule set up for 5 epochs but run for 10 (so the LR climbed back up
-for the last few epochs), and test numbers taken from the last epoch instead
-of the saved checkpoint. Looking into that also turned up three problems
-with what the model was being fed:
+Task 2 fixed how the history features were computed: an agent's velocity
+at each past moment was being compared against the ego's velocity *now*,
+not at that same moment, which mixed the ego's own acceleration into every
+agent's features (worst during turns and braking). Going through the
+retraining for that turned up more issues with what the model was being
+fed:
 
 - agents had to be visible in every one of the 10 history frames, so any
   tracker dropout removed them completely, and there was no distance filter
@@ -90,11 +90,15 @@ with what the model was being fed:
   order -- so nearby cars could be cut, and when the ego itself was cut,
   some other object was silently treated as the ego.
 
-All of these are fixed on the `meeting-prep` branch (see
-`notebooks/Av2_retrain_meeting_prep.ipynb`), which then trains the
-pre-Task-2 (t) and Task 2 (tau) feature conventions side by side: same
-initial weights, same scenarios in the same order, only the convention
-differs.
+The training run itself also had problems: the learning rate schedule was
+set up for 5 epochs but ran for 10 (so the LR climbed back up for the last
+few epochs), and test numbers came from the last epoch instead of the saved
+best checkpoint.
+
+All of these are fixed on the `meeting-prep` branch, and the model is
+retrained from scratch with them (`notebooks/Av2_retrain_meeting_prep.ipynb`).
+Since the earlier models were trained on partly wrong inputs, their ADE/FDE
+aren't compared against here -- these numbers are the new baseline.
 
 <!-- RESULTS: paste the table printed at the end of Av2_retrain_meeting_prep.ipynb here -->
 _Results pending: this run hasn't been done yet._
@@ -193,14 +197,13 @@ tests/
   test_transforms.py     time-matched (tau) vs decision-instant (t) regression test
   test_features.py       ROI selection, dropout filling, map selection
 notebooks/
-  Av2_retrain_meeting_prep.ipynb       tau vs t retrain + diagnostics + ablation (Colab)
+  Av2_retrain_meeting_prep.ipynb       retrain with bug fixes + diagnostics + ablation (Colab)
   Av2_closed_loop_meeting_prep.ipynb   closed loop on real scenarios, both costs (Colab)
 weights/
   stage1_weights.pth        pre-tau baseline (old selection, 6 agent features)
   best_weights_v2.pth       pre-tau baseline, best-of-run (old selection, 6 agent features)
   stage1_weights_tau.pth    first tau retrain (old selection, 6 agent features)
-  stage1_roi_tau.pth        produced by Av2_retrain_meeting_prep.ipynb -- current
-  stage1_roi_t.pth          same run, pre-Task-2 features, for the comparison only
+  stage1_weights_roi.pth    produced by Av2_retrain_meeting_prep.ipynb -- current
 ```
 
 The three older checkpoints were trained with 6 agent features; load them
