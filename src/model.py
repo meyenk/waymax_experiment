@@ -12,6 +12,8 @@ time t (see transforms.py) before reaching this model.
 import torch
 import torch.nn as nn
 
+from src.features import AGENT_FEAT_DIM
+
 
 class RelevancePool(nn.Module):
     """Learned softmax-weighted pooling over a set of item embeddings.
@@ -33,12 +35,15 @@ class RelevancePool(nn.Module):
 
 class AgentBranch(nn.Module):
     """Per-agent GRU over history + static class embedding, then relevance pool.
-    cont_feat_dim=6: [x, y, cos_yaw, sin_yaw, vx_rel, vy_rel] (ego frame).
+    cont_feat_dim=7: [x, y, cos_yaw, sin_yaw, vx_rel, vy_rel, observed] (ego
+    frame; observed = 1 for a real tracked frame, 0 for one filled in across a
+    tracker dropout -- see features.py). Checkpoints trained before the
+    observed flag existed used 6 -- load those with Stage1Model(agent_feat_dim=6).
     num_classes=8 gives headroom above WOMD's known ~5 object types (including
     "other") -- ids are also clamped defensively so an unexpected value never
     crashes training, it just gets bucketed into the last slot."""
 
-    def __init__(self, cont_feat_dim=6, num_classes=8, class_embed_dim=8, hidden_dim=64):
+    def __init__(self, cont_feat_dim=AGENT_FEAT_DIM, num_classes=8, class_embed_dim=8, hidden_dim=64):
         super().__init__()
         self.num_classes = num_classes
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
@@ -106,9 +111,9 @@ class Stage1Model(nn.Module):
     """Full pipeline: three branches -> concat with ego (yaw, speed) -> decoder MLP
     -> predicted ego future trajectory (future_len steps, single-shot, cumsum'd)."""
 
-    def __init__(self, hidden_dim=64, future_len=30, ego_dim=3):
+    def __init__(self, hidden_dim=64, future_len=30, ego_dim=3, agent_feat_dim=AGENT_FEAT_DIM):
         super().__init__()
-        self.agent_branch = AgentBranch(hidden_dim=hidden_dim)
+        self.agent_branch = AgentBranch(cont_feat_dim=agent_feat_dim, hidden_dim=hidden_dim)
         self.map_branch = MapBranch(hidden_dim=hidden_dim)
         self.light_branch = TrafficLightBranch(hidden_dim=hidden_dim)
         self.future_len = future_len

@@ -100,8 +100,10 @@ def make_turning_scenario(hist_len=5, num_timesteps=20):
         x[ego_idx, tt] = i * 1.0
 
     # stationary agent, off to the side, valid for the whole window + margin
-    x[1, :] = 50.0
-    y[1, :] = 50.0
+    # (inside the 50m agent ROI -- it was at (50, 50), ~70m out, before the
+    # ROI existed)
+    x[1, :] = 30.0
+    y[1, :] = 30.0
 
     log_trajectory = types.SimpleNamespace(x=x, y=y, yaw=yaw, vel_x=vel_x, vel_y=vel_y, valid=valid)
     object_metadata = types.SimpleNamespace(object_types=np.array([1, 1]))
@@ -119,7 +121,7 @@ def test_extract_agents_uses_time_matched_velocity():
     out = extract_agents(scenario, ego_idx, t, hist_len=hist_len)
     assert out is not None
 
-    # feats: (MAX_AGENTS, hist_len, 6) = [x, y, cos_yaw, sin_yaw, vx_rel, vy_rel]
+    # feats: (MAX_AGENTS, hist_len, 7) = [x, y, cos_yaw, sin_yaw, vx_rel, vy_rel, observed]
     agent_vxvy_rel = out["hist"][0, :, 4:6]  # our stationary agent is object idx 1 -> first non-ego slot
     per_step_diff = np.abs(np.diff(agent_vxvy_rel, axis=0)).max()
     print(f"extract_agents: max step-to-step change in v_rel across the window = {per_step_diff:.2f} m/s")
@@ -130,7 +132,24 @@ def test_extract_agents_uses_time_matched_velocity():
         "bug is still present")
 
 
+def test_time_matched_flag_off_reproduces_t_anchoring():
+    """time_matched=False exists only to rerun the before/after-Task-2
+    comparison on identical code: it must give the old t-anchored features,
+    i.e. a stationary agent's relative velocity is CONSTANT across the window
+    (one ego velocity subtracted everywhere), and the current frame (tau=t)
+    must agree with the time-matched version."""
+    hist_len = 5
+    scenario, ego_idx, t = make_turning_scenario(hist_len=hist_len)
+    on = extract_agents(scenario, ego_idx, t, hist_len=hist_len, time_matched=True)["hist"][0]
+    off = extract_agents(scenario, ego_idx, t, hist_len=hist_len, time_matched=False)["hist"][0]
+    assert np.allclose(off[:, 4:6], off[0, 4:6]), "t-anchored v_rel of a stationary agent should be constant"
+    assert np.allclose(on[-1], off[-1]), "both conventions must agree at the current instant"
+    assert not np.allclose(on, off), "the two conventions should differ over the window under a sharp turn"
+    print("time_matched=False reproduces the t-anchored features; agrees with tau at tau=t")
+
+
 if __name__ == "__main__":
     test_windowed_vs_single_reference_differ_under_ego_turn()
     test_extract_agents_uses_time_matched_velocity()
+    test_time_matched_flag_off_reproduces_t_anchoring()
     print("\nall transform/time-matching tests passed")

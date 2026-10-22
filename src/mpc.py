@@ -271,8 +271,20 @@ def sample_candidate_controls(state0, ref_controls, dt, n_candidates=32,
 # ---------------------------------------------------------------------------
 
 def compute_cost(ego_states, other_agent_rollouts, dt,
-                  collision_radius=2.5, w_collision=50.0, w_progress=1.0, w_comfort=0.05):
-    """ego_states: (horizon+1, 4). other_agent_rollouts: (N, horizon+1, 4)."""
+                  collision_radius=2.5, w_collision=50.0, w_progress=1.0, w_comfort=0.05,
+                  progress_along_heading=False, ref_states=None, w_ref_speed=0.0):
+    """ego_states: (horizon+1, 4). other_agent_rollouts: (N, horizon+1, 4).
+
+    Defaults reproduce the original cost exactly. Two opt-in calibrations
+    (meeting-prep branch), aimed at the first real-data runs where the
+    planner sped up to ~18 m/s while the human was nearly stopped:
+      progress_along_heading=True: progress is net displacement projected
+        onto the ego's initial heading, not straight-line distance in any
+        direction (so drifting sideways no longer counts as progress).
+      w_ref_speed > 0 (needs ref_states, the reference trajectory rolled out
+        through the bicycle model): adds w_ref_speed * sum_t (v_t - v_ref_t)^2,
+        i.e. "go at the pace the encoder predicted". Without it the progress
+        term alone always rewards going faster."""
     horizon = ego_states.shape[0] - 1
 
     # collision: soft penalty once inside collision_radius, scaled by how deep
@@ -285,14 +297,21 @@ def compute_cost(ego_states, other_agent_rollouts, dt,
             if d < collision_radius:
                 collision_cost += (collision_radius - d) ** 2
 
-    # progress: reward forward travel -> cost is negative net displacement
-    # KNOWN LIMITATION: this is straight-line net displacement in ANY
-    # direction, not projected onto the ego's original heading -- a
-    # candidate that drifts sideways scores the same "progress" as one that
-    # goes straight ahead. Not addressed in this task; flagged for awareness.
-    progress = np.hypot(ego_states[-1, 0] - ego_states[0, 0],
-                         ego_states[-1, 1] - ego_states[0, 1])
+    # progress: reward forward travel -> cost is negative net displacement.
+    # Default (progress_along_heading=False) is straight-line displacement in
+    # ANY direction -- a sideways drift scores the same as going straight
+    # ahead. Kept as the default so earlier results stay reproducible.
+    d_xy = ego_states[-1, :2] - ego_states[0, :2]
+    if progress_along_heading:
+        yaw0 = ego_states[0, 2]
+        progress = d_xy[0] * np.cos(yaw0) + d_xy[1] * np.sin(yaw0)
+    else:
+        progress = np.hypot(d_xy[0], d_xy[1])
     progress_cost = -progress
+
+    ref_speed_cost = 0.0
+    if w_ref_speed > 0.0 and ref_states is not None:
+        ref_speed_cost = np.sum((ego_states[1:, 3] - ref_states[1:, 3]) ** 2)
 
     # comfort: penalize speed changes and heading-rate changes step to step
     # KNOWN LIMITATION: dyaw is not wrapped to [-pi, pi] -- only matters for
@@ -304,7 +323,8 @@ def compute_cost(ego_states, other_agent_rollouts, dt,
 
     return (w_collision * collision_cost
             + w_progress * progress_cost
-            + w_comfort * comfort_cost)
+            + w_comfort * comfort_cost
+            + w_ref_speed * ref_speed_cost)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +364,9 @@ def run_mpc_step(ego_state0, ref_trajectory_xy, other_agent_states, dt,
     candidates = sample_candidate_controls(
         ego_state0, ref_controls, dt, n_candidates=n_candidates,
         r_min=r_min, r_max=r_max)
+    cost_kwargs = dict(cost_kwargs or {})
+    if cost_kwargs.get("w_ref_speed", 0.0) > 0.0:
+        cost_kwargs["ref_states"] = rollout_bicycle(ego_state0, ref_controls, dt)
 
     costs = np.zeros(candidates.shape[0])
     rollouts = []
@@ -351,7 +374,7 @@ def run_mpc_step(ego_state0, ref_trajectory_xy, other_agent_states, dt,
         ego_states = rollout_bicycle(ego_state0, candidates[k], dt)
         other_rollouts = rollout_other_agents(
             other_agent_states, ego_states, horizon, dt, reactive=reactive)
-        costs[k] = compute_cost(ego_states, other_rollouts, dt, **(cost_kwargs or {}))
+        costs[k] = compute_cost(ego_states, other_rollouts, dt, **cost_kwargs)
         rollouts.append(ego_states)
 
     best_idx = int(np.argmin(costs))
@@ -365,7 +388,7 @@ def run_mpc_step(ego_state0, ref_trajectory_xy, other_agent_states, dt,
     blended_states = rollout_bicycle(ego_state0, blended_controls, dt)
     blended_other = rollout_other_agents(
         other_agent_states, blended_states, horizon, dt, reactive=reactive)
-    blended_cost = compute_cost(blended_states, blended_other, dt, **(cost_kwargs or {}))
+    blended_cost = compute_cost(blended_states, blended_other, dt, **cost_kwargs)
 
     if blended_cost <= best_individual_cost:
         chosen_controls, chosen_states, chosen_cost = blended_controls, blended_states, blended_cost

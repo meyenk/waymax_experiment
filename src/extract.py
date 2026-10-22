@@ -11,25 +11,9 @@ specifically so a mismatch is easy to isolate and fix.
 """
 
 import numpy as np
-from src.transforms import transform_positions, transform_velocities, transform_yaw
-
-MAX_AGENTS = 32
-MAX_MAP_POINTS = 200
-MAX_LIGHTS = 16
-
-
-def _pad(arr, max_n):
-    """Pad first axis of arr with zeros up to max_n; return (padded, mask)."""
-    n = arr.shape[0]
-    mask = np.zeros(max_n, dtype=bool)
-    if n == 0:
-        pad_shape = (max_n,) + arr.shape[1:]
-        return np.zeros(pad_shape, dtype=arr.dtype), mask
-    mask[:min(n, max_n)] = True
-    if n >= max_n:
-        return arr[:max_n], mask
-    pad_shape = (max_n - n,) + arr.shape[1:]
-    return np.concatenate([arr, np.zeros(pad_shape, dtype=arr.dtype)], axis=0), mask
+from src import features as F
+from src.features import pad as _pad  # kept importable under the old name
+from src.transforms import transform_positions
 
 
 def get_ego_frame(scenario, ego_idx, t):
@@ -47,106 +31,123 @@ def get_ego_frame_window(scenario, ego_idx, t0, t):
     """Returns (ego_xy, ego_yaw, ego_vxvy) over the window [t0, t] inclusive
     -- (hist_len, 2), (hist_len,), (hist_len, 2) -- the ego's own state at
     EACH individual historical instant, not just at t (Part B, task 2: the
-    time-matched / tau convention, needed so a historical entry is expressed
-    relative to where the ego actually was at that same instant)."""
+    time-matched / tau convention). Frames where the ego itself is invalid
+    are filled from its neighbours (features.ego_window)."""
     traj = scenario.log_trajectory
     ego_xy = np.stack([traj.x[ego_idx, t0:t + 1], traj.y[ego_idx, t0:t + 1]], axis=-1)
     ego_yaw = np.array(traj.yaw[ego_idx, t0:t + 1])
     ego_vxvy = np.stack([traj.vel_x[ego_idx, t0:t + 1], traj.vel_y[ego_idx, t0:t + 1]], axis=-1)
-    return ego_xy, ego_yaw, ego_vxvy
+    return F.ego_window(ego_xy, ego_yaw, ego_vxvy, np.array(traj.valid[ego_idx, t0:t + 1]))
 
 
-def extract_agents(scenario, ego_idx, t, hist_len=10):
-    """Non-ego agents, history window [t-hist_len+1, t], time-matched (tau)
-    ego frame: each historical instant is expressed relative to the ego's
-    own state at that same instant, not the ego's state at the current
-    decision instant t (Part B, task 2).
-    Returns hist_feats (MAX_AGENTS, hist_len, 6), class_ids (MAX_AGENTS,), mask (MAX_AGENTS,).
-    Vectorized across agents (no per-agent Python loop) -- this was the main
-    slow part of extraction before."""
+def select_agents(scenario, ego_idx, t):
+    """Object indices the model looks at, at decision instant t: valid at t,
+    not the ego, within features.AGENT_RADIUS of the ego, nearest-first,
+    capped at features.MAX_AGENTS. Exposed separately so the visualization
+    can show exactly what was (and wasn't) picked."""
+    traj = scenario.log_trajectory
+    valid_now = np.array(traj.valid[:, t]).copy()
+    valid_now[ego_idx] = False
+    cand = np.where(valid_now)[0]
+    ego_xy = np.array([traj.x[ego_idx, t], traj.y[ego_idx, t]])
+    xy_now = np.stack([np.array(traj.x)[cand, t], np.array(traj.y)[cand, t]], axis=-1)
+    dist = np.linalg.norm(xy_now - ego_xy, axis=-1)
+    return cand[F.nearest_within(dist, F.AGENT_RADIUS, F.MAX_AGENTS)]
+
+
+def extract_agents(scenario, ego_idx, t, hist_len=10, time_matched=True):
+    """Non-ego agents in the region of interest at t (see select_agents),
+    history window [t-hist_len+1, t] with tracker dropouts filled in and
+    flagged (features.py). time_matched=True: each historical instant is
+    expressed relative to the ego's own state at that same instant (Part B,
+    task 2); False reproduces the pre-Task-2 (t-anchored) features, for the
+    before/after comparison only.
+    Returns hist_feats (MAX_AGENTS, hist_len, AGENT_FEAT_DIM), class_ids (MAX_AGENTS,), mask (MAX_AGENTS,)."""
     traj = scenario.log_trajectory
     t0 = t - hist_len + 1
     if t0 < 0:
         return None  # not enough history at this t
     ego_xy, ego_yaw, ego_vxvy = get_ego_frame_window(scenario, ego_idx, t0, t)
 
-    valid_window = np.array(traj.valid[:, t0:t + 1])   # (num_objects, hist_len)
-    full_valid = valid_window.all(axis=1)               # (num_objects,)
-    full_valid[ego_idx] = False                          # exclude ego
-    idx = np.where(full_valid)[0]
-
+    idx = select_agents(scenario, ego_idx, t)
     if len(idx) == 0:
         return {
-            "hist": np.zeros((MAX_AGENTS, hist_len, 6), dtype=np.float32),
-            "class": np.zeros(MAX_AGENTS, dtype=np.int64),
-            "mask": np.zeros(MAX_AGENTS, dtype=bool),
+            "hist": np.zeros((F.MAX_AGENTS, hist_len, F.AGENT_FEAT_DIM), dtype=np.float32),
+            "class": np.zeros(F.MAX_AGENTS, dtype=np.int64),
+            "mask": np.zeros(F.MAX_AGENTS, dtype=bool),
         }
 
-    xy_raw = np.stack([np.array(traj.x)[idx, t0:t + 1], np.array(traj.y)[idx, t0:t + 1]], axis=-1)
-    xy = transform_positions(xy_raw, ego_xy, ego_yaw)
-    yaw = transform_yaw(np.array(traj.yaw)[idx, t0:t + 1], ego_yaw)
-    v_raw = np.stack([np.array(traj.vel_x)[idx, t0:t + 1], np.array(traj.vel_y)[idx, t0:t + 1]], axis=-1)
-    v_rel = transform_velocities(v_raw, ego_vxvy, ego_yaw)
-    feats = np.concatenate([xy, np.cos(yaw)[..., None], np.sin(yaw)[..., None], v_rel], axis=-1).astype(np.float32)
+    w = slice(t0, t + 1)
+    observed = np.array(traj.valid)[idx, w]
+    raw = np.stack([np.array(traj.x)[idx, w], np.array(traj.y)[idx, w], np.array(traj.yaw)[idx, w],
+                    np.array(traj.vel_x)[idx, w], np.array(traj.vel_y)[idx, w]], axis=-1)
+    filled = F.fill_gaps(raw, observed, angle_channels=(2,))
+    feats = F.agent_features(filled[..., :2], filled[..., 2], filled[..., 3:5], observed,
+                             ego_xy, ego_yaw, ego_vxvy, time_matched=time_matched)
 
     # ADAPT: object_metadata.object_types field name/encoding may differ
     cls = np.array(scenario.object_metadata.object_types)[idx].astype(np.int64)
 
-    hist, mask = _pad(feats, MAX_AGENTS)
-    cls, _ = _pad(cls, MAX_AGENTS)
+    hist, mask = F.pad(feats, F.MAX_AGENTS)
+    cls, _ = F.pad(cls, F.MAX_AGENTS)
     return {"hist": hist, "class": cls, "mask": mask}
 
 
 def extract_map(scenario, ego_idx, t):
-    """Static roadgraph points (lane markings, stop signs, crosswalks, ...), ego frame.
-    Returns xy (MAX_MAP_POINTS, 2), type_ids (MAX_MAP_POINTS,), mask (MAX_MAP_POINTS,)."""
+    """Static roadgraph points (lane markings, stop signs, crosswalks, ...),
+    ego frame at t: everything within features.MAP_RADIUS, nearest-first,
+    capped at features.MAX_MAP_POINTS (see features.select_map).
+    Returns xy (MAX_MAP_POINTS, 2), type_ids, mask, and n_in_radius (how many
+    were in range before the cap -- popped by collate, used for stats)."""
     ego_xy, ego_yaw, _ = get_ego_frame(scenario, ego_idx, t)
     rg = scenario.roadgraph_points
     valid = np.array(rg.valid)
     xy_raw = np.stack([np.array(rg.x)[valid], np.array(rg.y)[valid]], axis=-1)
     types = np.array(rg.types)[valid].astype(np.int64)
 
-    # keep only nearby points to bound compute -- crude radius filter pre-padding
-    xy_local = transform_positions(xy_raw, ego_xy, ego_yaw)
-    dist = np.linalg.norm(xy_local, axis=-1)
-    keep = dist <= 80.0  # meters, generous radius
-    xy_local, types = xy_local[keep], types[keep]
-
-    xy_local, mask = _pad(xy_local.astype(np.float32), MAX_MAP_POINTS)
-    types, _ = _pad(types, MAX_MAP_POINTS)
-    return {"xy": xy_local, "type": types, "mask": mask}
+    xy_local, types, n_in_radius = F.select_map(xy_raw, types, ego_xy, ego_yaw)
+    xy_local, mask = F.pad(xy_local, F.MAX_MAP_POINTS)
+    types, _ = F.pad(types, F.MAX_MAP_POINTS)
+    return {"xy": xy_local, "type": types, "mask": mask, "n_in_radius": n_in_radius}
 
 
-def extract_traffic_lights(scenario, ego_idx, t, hist_len=10):
-    """Traffic light stop-line positions + state over history, time-matched
-    (tau) ego frame -- position only, lights have no yaw/velocity feature
-    (Part B, task 2).
+def extract_traffic_lights(scenario, ego_idx, t, hist_len=10, time_matched=True):
+    """Traffic light stop-line positions + state over history, ego frame
+    (time-matched by default, same flag as extract_agents) -- position only,
+    lights have no yaw/velocity feature. A light is used if it's valid at t
+    and within features.MAP_RADIUS, nearest-first; frames where it wasn't
+    observed get state 0 (UNKNOWN) and its current position.
     ADAPT: field name/shape for your Waymax version -- assumed scenario.log_traffic_light
-    with .x, .y, .state, .valid shaped (num_lights, num_timesteps).
-    Vectorized across lights (no per-light Python loop)."""
+    with .x, .y, .state, .valid shaped (num_lights, num_timesteps)."""
     t0 = t - hist_len + 1
     empty = {
-        "hist_xy": np.zeros((MAX_LIGHTS, hist_len, 2), dtype=np.float32),
-        "state": np.zeros((MAX_LIGHTS, hist_len), dtype=np.int64),
-        "mask": np.zeros(MAX_LIGHTS, dtype=bool),
+        "hist_xy": np.zeros((F.MAX_LIGHTS, hist_len, 2), dtype=np.float32),
+        "state": np.zeros((F.MAX_LIGHTS, hist_len), dtype=np.int64),
+        "mask": np.zeros(F.MAX_LIGHTS, dtype=bool),
     }
     if t0 < 0 or not hasattr(scenario, "log_traffic_light"):
         return empty
     ego_xy, ego_yaw, _ = get_ego_frame_window(scenario, ego_idx, t0, t)
 
     tl = scenario.log_traffic_light
-    valid_window = np.array(tl.valid[:, t0:t + 1])
-    full_valid = valid_window.all(axis=1)
-    idx = np.where(full_valid)[0]
+    valid_now = np.array(tl.valid[:, t])
+    cand = np.where(valid_now)[0]
+    if len(cand) == 0:
+        return empty
+    xy_now = np.stack([np.array(tl.x)[cand, t], np.array(tl.y)[cand, t]], axis=-1)
+    dist = np.linalg.norm(xy_now - ego_xy[-1], axis=-1)
+    idx = cand[F.nearest_within(dist, F.MAP_RADIUS, F.MAX_LIGHTS)]
     if len(idx) == 0:
         return empty
 
-    xy_raw = np.stack([np.array(tl.x)[idx, t0:t + 1], np.array(tl.y)[idx, t0:t + 1]], axis=-1)
-    xy = transform_positions(xy_raw, ego_xy, ego_yaw).astype(np.float32)
-    state = np.array(tl.state)[idx, t0:t + 1].astype(np.int64)
+    xy_world, state = F.light_window_world(tl, idx, t0, t)
+    if time_matched:
+        xy = transform_positions(xy_world, ego_xy, ego_yaw)
+    else:
+        xy = transform_positions(xy_world, ego_xy[-1], float(ego_yaw[-1]))
 
-    hist_xy, mask = _pad(xy, MAX_LIGHTS)
-    state, _ = _pad(state, MAX_LIGHTS)
+    hist_xy, mask = F.pad(xy.astype(np.float32), F.MAX_LIGHTS)
+    state, _ = F.pad(state, F.MAX_LIGHTS)
     return {"hist_xy": hist_xy, "state": state, "mask": mask}
 
 
@@ -174,16 +175,16 @@ def get_ego_vec(scenario, ego_idx, t):
     return np.array([1.0, 0.0, speed], dtype=np.float32)
 
 
-def extract_example(scenario, ego_idx, t, hist_len=10, future_len=30):
+def extract_example(scenario, ego_idx, t, hist_len=10, future_len=30, time_matched=True):
     """One full training example, or None if history/future isn't available at t."""
     target = extract_ego_target(scenario, ego_idx, t, future_len)
-    agents = extract_agents(scenario, ego_idx, t, hist_len)
+    agents = extract_agents(scenario, ego_idx, t, hist_len, time_matched=time_matched)
     if target is None or agents is None:
         return None
     return {
         "agent_hist": agents["hist"], "agent_class": agents["class"], "agent_mask": agents["mask"],
         **{f"map_{k}": v for k, v in extract_map(scenario, ego_idx, t).items()},
-        **{f"light_{k}": v for k, v in extract_traffic_lights(scenario, ego_idx, t, hist_len).items()},
+        **{f"light_{k}": v for k, v in extract_traffic_lights(scenario, ego_idx, t, hist_len, time_matched).items()},
         "ego_vec": get_ego_vec(scenario, ego_idx, t),
         "target": target,
     }

@@ -67,6 +67,11 @@ def make_fake_scenario(num_timesteps=60, hist_len=10):
 
 
 def test_closed_loop_runs():
+    # seeded: with a random-init model the "reference" is noise, and unseeded
+    # this occasionally produced a backward-drifting ego and failed the
+    # forward-progress assertion below (seen in the Task 2 retrain notebook).
+    np.random.seed(0)
+    torch.manual_seed(0)
     scenario, ego_idx = make_fake_scenario()
     model = Stage1Model(hidden_dim=64, future_len=30)  # random init, mechanics only
     log = run_closed_loop(scenario, model, ego_idx, t0=10, max_steps=8, dt=0.1)
@@ -83,7 +88,13 @@ def test_closed_loop_runs():
     print(f"closed loop ran {n_steps - 1} steps, ego moved {total_dx:.2f}m in x, "
           f"final speed={ego_path[-1, 3]:.2f} m/s")
     print(f"selection modes used: {set(log['selection_modes'])}")
-    assert total_dx > 0, "ego should have made forward progress, not stayed put or gone backward"
+    # NOT asserting forward progress any more: with a random-init model the
+    # reference is noise, so the direction the ego ends up going is down to
+    # the init (unseeded, this failed intermittently -- it did in the Task 2
+    # retrain notebook). Driving quality is checked on real data with a
+    # trained checkpoint, not here; this only checks the loop actually evolves.
+    assert np.all(np.isfinite(ego_path)), "ego states should stay finite"
+    assert np.abs(np.diff(ego_path[:, :2], axis=0)).sum() > 0, "ego should actually move between steps"
 
     ref = log["ref_trajectories"][0]
     assert ref.shape == (30, 2)
@@ -270,6 +281,110 @@ def test_mid_scene_agent_entry():
     print("mid-scene agent entry ok: agent 1 entered active set at t=8 with s=0")
 
 
+# ---------------------------------------------------------------------------
+# Tracker dropouts (meeting-prep branch): real WOMD validity masks have holes
+# in ~95% of scenarios. Short ones are bridged, long ones split into spans.
+# ---------------------------------------------------------------------------
+
+def _straight_agent_scene(valid_row, num_timesteps=40, speed=5.0):
+    """ego parked at the origin, agent 1 driving +x at `speed` from x=10,
+    agent 1's validity given by valid_row."""
+    x = np.zeros((2, num_timesteps)); y = np.zeros((2, num_timesteps)); yaw = np.zeros((2, num_timesteps))
+    vel_x = np.zeros((2, num_timesteps)); vel_y = np.zeros((2, num_timesteps))
+    x[1] = 10.0 + speed * 0.1 * np.arange(num_timesteps)
+    vel_x[1] = speed
+    valid = np.ones((2, num_timesteps), dtype=bool)
+    valid[1] = valid_row
+    x[1, ~valid[1]] = -1.0  # Waymax-style garbage where invalid
+    return types.SimpleNamespace(
+        log_trajectory=types.SimpleNamespace(x=x, y=y, yaw=yaw, vel_x=vel_x, vel_y=vel_y, valid=valid),
+        object_metadata=types.SimpleNamespace(object_types=np.array([1, 1])),
+    )
+
+
+def test_short_dropout_is_bridged():
+    """A 3-frame dropout used to raise (whole scenario unusable). Now the
+    agent stays in the sim through it, its path interpolated across the hole
+    (not through the -1 sentinel values), and the bridged frames are flagged
+    as unobserved in its model history."""
+    valid_row = np.ones(40, dtype=bool)
+    valid_row[12:15] = False
+    scenario = _straight_agent_scene(valid_row)
+    paths = build_agent_paths(scenario, ego_idx=0)
+    assert len(paths["spans"][1]) == 1, "a short gap should not split the object"
+    path = paths["paths"][1]
+    assert np.all(np.diff(path.waypoints_xy[:, 0]) > 0), "path should be interpolated, monotone in x"
+
+    agents = ActiveAgentSet(paths, hist_len=10)
+    for t in range(10, 20):
+        agents.sync(scenario, t)
+        assert 1 in agents.order, f"agent should stay active through the dropout (t={t})"
+    agents2 = ActiveAgentSet(paths, hist_len=10)
+    agents2.sync(scenario, 16)  # window [7, 16] covers the dropout at 12..14
+    assert agents2.hist_obs[1].tolist() == [1, 1, 1, 1, 1, 0, 0, 0, 1, 1]
+    print("short dropout ok: agent kept through a 3-frame gap, path interpolated, frames flagged")
+
+
+def test_long_gap_splits_and_reenters():
+    """A gap longer than MAX_BRIDGE_GAP means the object really left: it is
+    dropped at the gap and re-enters at its next span with s=0 on that span's
+    own path."""
+    valid_row = np.ones(40, dtype=bool)
+    valid_row[10:25] = False  # 15 frames > MAX_BRIDGE_GAP (10)
+    scenario = _straight_agent_scene(valid_row)
+    paths = build_agent_paths(scenario, ego_idx=0)
+    spans = paths["spans"][1]
+    assert [(a, b) for a, b, _ in spans] == [(0, 9), (25, 39)], f"unexpected spans {[(a, b) for a, b, _ in spans]}"
+
+    agents = ActiveAgentSet(paths, hist_len=5)
+    agents.sync(scenario, 9)
+    assert 1 in agents.order
+    agents.sync(scenario, 10)
+    assert 1 not in agents.order, "agent should leave at the start of a long gap"
+    agents.sync(scenario, 25)
+    assert 1 in agents.order and agents.s[1] == 0.0, "agent should re-enter at its next span with s=0"
+    assert np.isclose(agents.state[1][0], scenario.log_trajectory.x[1, 25])
+    print("long gap ok: object split into spans (0-9, 25-39), dropped and re-entered with s=0")
+
+
+def test_far_agents_simulated_but_not_in_mpc():
+    """Every active agent is simulated, but only those within
+    MPC_AGENT_RADIUS go into the MPC rollouts (and only those within the
+    agent ROI go to the model)."""
+    from src.closed_loop import MPC_AGENT_RADIUS
+    np.random.seed(0)
+    torch.manual_seed(0)
+    scenario, ego_idx = make_fake_scenario()
+    traj = scenario.log_trajectory
+    traj.x[2] += MPC_AGENT_RADIUS + 50.0  # push agent 2 far ahead of everyone
+    model = Stage1Model(hidden_dim=64, future_len=30)
+    log = run_closed_loop(scenario, model, ego_idx, t0=10, max_steps=3, dt=0.1)
+    for k in range(3):
+        assert set(log["agent_ids"][k].tolist()) == {1, 2}, "both agents should be simulated"
+        assert log["mpc_agent_ids"][k].tolist() == [1], "far agent should be left out of MPC rollouts"
+        assert log["model_agent_ids"][k].tolist() == [1], "far agent should be outside the model's ROI"
+    print("far agents ok: simulated every step, excluded from MPC rollouts and model input")
+
+
+def test_ref_speed_cost_tracks_reference_pace():
+    """The opt-in cost calibration: with only the original progress reward,
+    the planner prefers whichever candidate goes furthest; with w_ref_speed
+    it should end closer to the reference's own speed."""
+    from src.mpc import run_mpc_step
+    dt, horizon = 0.1, 30
+    state0 = np.array([0.0, 0.0, 0.0, 3.0])
+    ref_xy = np.stack([3.0 * dt * np.arange(1, horizon + 1), np.zeros(horizon)], axis=-1)  # hold 3 m/s
+    np.random.seed(1)
+    base = run_mpc_step(state0, ref_xy, np.zeros((0, 4)), dt, n_candidates=64, reactive=False)
+    np.random.seed(1)
+    cal = run_mpc_step(state0, ref_xy, np.zeros((0, 4)), dt, n_candidates=64, reactive=False,
+                       cost_kwargs={"w_ref_speed": 1.0, "progress_along_heading": True})
+    err_base = np.abs(base["best_states"][1:, 3] - 3.0).mean()
+    err_cal = np.abs(cal["best_states"][1:, 3] - 3.0).mean()
+    print(f"ref-speed cost ok: mean |v - v_ref| original cost={err_base:.2f} m/s, calibrated={err_cal:.2f} m/s")
+    assert err_cal < err_base, "calibrated cost should track the reference pace more closely"
+
+
 if __name__ == "__main__":
     test_closed_loop_runs()
     test_agent_follows_curving_logged_path()
@@ -277,4 +392,8 @@ if __name__ == "__main__":
     test_agent_dropped_when_valid_flag_goes_false()
     test_agents_already_present_are_picked_up_at_t0()
     test_mid_scene_agent_entry()
+    test_short_dropout_is_bridged()
+    test_long_gap_splits_and_reenters()
+    test_far_agents_simulated_but_not_in_mpc()
+    test_ref_speed_cost_tracks_reference_pace()
     print("\nall closed_loop tests passed")
