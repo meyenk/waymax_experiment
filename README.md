@@ -39,6 +39,17 @@ The three pooled vectors are concatenated together with the ego car's own
 current yaw and speed, and this combined vector is passed through a decoder
 MLP that outputs the predicted future trajectory directly.
 
+What goes into each branch is a region of interest around the car at the
+moment of the decision (`src/features.py`, shared by training and the
+closed loop so they can't drift apart):
+
+- agents: everyone visible right now within 50 m, nearest 32. If the
+  tracker lost an agent for a few frames within its 1 s history (occlusion
+  happens a lot in real logs), those frames are interpolated and flagged
+  with an extra "observed" feature, instead of dropping the agent entirely.
+- map: every roadgraph point within 80 m, nearest first.
+- traffic lights: visible now, within 80 m, nearest first.
+
 Everything (positions, velocities, map points, light positions) is
 transformed into the ego car's own coordinate frame before being fed in,
 since what matters for driving is where something is relative to you, not
@@ -61,9 +72,36 @@ training times reasonable while things are still being worked out. Worth
 keeping in mind when looking at any numbers here, they're not yet from the
 full dataset.
 
-A retrain against these updated (time-matched) features has been run
-(`weights/stage1_weights_tau.pth`). Results are still being looked into
-before drawing conclusions from them, so not detailed here yet.
+### Retrain: before vs after Task 2, under identical conditions
+
+The first retrain after Task 2 (`weights/stage1_weights_tau.pth`) couldn't be
+compared cleanly with the earlier model: different epoch counts, a learning
+rate schedule set up for 5 epochs but run for 10 (so the LR climbed back up
+for the last few epochs), and test numbers taken from the last epoch instead
+of the saved checkpoint. Looking into that also turned up three problems
+with what the model was being fed:
+
+- agents had to be visible in every one of the 10 history frames, so any
+  tracker dropout removed them completely, and there was no distance filter
+  or ranking at all;
+- the map branch got the first 200 points within 80 m in array order,
+  essentially an arbitrary subset of the road;
+- the data loader was capped at 32 objects, which Waymax applies in file
+  order -- so nearby cars could be cut, and when the ego itself was cut,
+  some other object was silently treated as the ego.
+
+All of these are fixed on the `meeting-prep` branch (see
+`notebooks/Av2_retrain_meeting_prep.ipynb`), which then trains the
+pre-Task-2 (t) and Task 2 (tau) feature conventions side by side: same
+initial weights, same scenarios in the same order, only the convention
+differs.
+
+<!-- RESULTS: paste the table printed at the end of Av2_retrain_meeting_prep.ipynb here -->
+_Results pending: this run hasn't been done yet._
+
+The same notebook also runs a branch ablation (hide agents / map / lights
+at inference and see how much the prediction changes), to check whether the
+model actually uses the scene or mostly extrapolates its own speed.
 
 ## Stage 2: closed-loop MPC planner
 
@@ -79,18 +117,30 @@ a real per-step simulation where both the ego and other agents run their own
 dynamics instead of replaying the log.
 
 Status: implemented and unit-tested against synthetic scenarios (see
-`tests/`), architecturally compatible with the retrained encoder (no code
-changes needed to use `stage1_weights_tau.pth`). Now also run against real
-Waymax scenarios, which surfaced two issues currently being worked through
-before the results are worth trusting:
+`tests/`). The first runs against real Waymax scenarios
+(`Av2_closed_loop.ipynb`) surfaced two issues, both addressed on the
+`meeting-prep` branch:
 
-- A design assumption behind the path-following agents (each object appears,
-  drives, and disappears exactly once) doesn't hold on most real scenarios --
-  real validity masks have gaps (occlusion/tracker dropouts), which the code
-  currently refuses to guess about rather than silently mishandling.
-- The planner's cost function needs calibration -- isolated testing shows it
-  currently rewards covering distance over matching the reference's pace,
-  which compounds badly across many replanning steps.
+- The path-following agents assumed each object appears, drives and
+  disappears exactly once. On real data 95% of scenarios have at least one
+  object that drops out for a few frames and comes back, and the code
+  refused those scenarios, leaving 2 usable out of 60. Now gaps of up to
+  1 s are bridged (the agent stays in the sim, its path interpolated) and
+  longer gaps split the object into separate appearances.
+- The planner's cost rewarded covering distance in any direction, so with
+  nothing else pulling on speed it sped up (18 m/s while the human was
+  nearly stopped). There's now an opt-in calibrated cost (progress measured
+  along the heading, plus a penalty on deviating from the reference's
+  speed). It's run side by side with the original in
+  `notebooks/Av2_closed_loop_meeting_prep.ipynb`. It's a first calibration,
+  not a tuned one.
+
+Also: every agent is still simulated, but only those within 50 m enter the
+planner's candidate rollouts, and the model sees the same region-of-interest
+selection as in training.
+
+<!-- RESULTS: closed-loop summary table from Av2_closed_loop_meeting_prep.ipynb -->
+_Results pending._
 
 ## What this could become
 
@@ -98,12 +148,22 @@ The closed-loop planner above is the "combine with a proper planner" step
 this section used to describe as future work -- now built, being debugged
 against real data. From here:
 
-- Settle how the path-following agents should handle real (gappy) validity
-  data, then recalibrate the planner's cost function against real scenarios.
-- A cheap diagnostic worth running alongside that: mask out the agent/map/
-  light branches at inference and see how much the prediction actually
-  changes -- tells us whether the model is using scene context at all, or
-  substantially just extrapolating its own current speed/heading.
+- Depending on what the ablation shows: if the model barely uses the
+  scene, look at what it's missing first -- it currently gets the ego's
+  current speed only (no ego history, acceleration or yaw rate) and no idea
+  of where the car is headed (route/goal).
+- Predict several possible futures instead of one. A single MSE-trained
+  trajectory averages between options (turn vs go straight) and lands in
+  between, which is consistent with the "keeps doing what it's doing" bias.
+  A distribution would also give the planner something principled to sample
+  from.
+- On the planner side: time-correlated sampling noise (smoother candidates
+  than independent per-step noise), warm-starting from the previous step's
+  plan, and proper cost tuning.
+- Possibly compare against Waymax's own built-in IDM agents and metrics
+  (off-road, overlap, log divergence) instead of only our own.
+- The agent region of interest is a fixed 50 m for now; making it depend on
+  speed (or on where the car is headed) is an easy next step.
 - There's also more to explore around the "only pay attention to a few
   things" idea itself, being more selective about which agents actually
   matter, tied to where the car is actually headed, rather than looking at
@@ -116,6 +176,7 @@ against real data. From here:
 
 ```
 src/
+  features.py      what the model sees: ROI selection, dropout filling (shared)
   transforms.py    ego frame conversions (time-matched/tau, see above)
   model.py         the Stage 1 model itself
   extract.py       pulls one training example out of a scenario
@@ -130,8 +191,18 @@ tests/
   test_mpc.py            dynamics/mpc unit tests, synthetic data
   test_closed_loop.py    closed-loop wiring + path-following agent tests
   test_transforms.py     time-matched (tau) vs decision-instant (t) regression test
+  test_features.py       ROI selection, dropout filling, map selection
+notebooks/
+  Av2_retrain_meeting_prep.ipynb       tau vs t retrain + diagnostics + ablation (Colab)
+  Av2_closed_loop_meeting_prep.ipynb   closed loop on real scenarios, both costs (Colab)
 weights/
-  stage1_weights.pth        pre-tau baseline
-  best_weights_v2.pth       pre-tau baseline, best-of-run
-  stage1_weights_tau.pth    current -- trained on time-matched features
+  stage1_weights.pth        pre-tau baseline (old selection, 6 agent features)
+  best_weights_v2.pth       pre-tau baseline, best-of-run (old selection, 6 agent features)
+  stage1_weights_tau.pth    first tau retrain (old selection, 6 agent features)
+  stage1_roi_tau.pth        produced by Av2_retrain_meeting_prep.ipynb -- current
+  stage1_roi_t.pth          same run, pre-Task-2 features, for the comparison only
 ```
+
+The three older checkpoints were trained with 6 agent features; load them
+with `Stage1Model(agent_feat_dim=6)`. They don't match the current feature
+extraction, so they're kept as a record rather than for use.

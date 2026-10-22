@@ -1,5 +1,29 @@
 # CLAUDE.md — Waymax MPC Phase 2
 
+## Status update (2026-10-22, `meeting-prep` branch)
+
+Supersedes the banner below where they disagree.
+- **Closed loop on real scenarios** -- run (`Av2_closed_loop.ipynb`). Found:
+  95% of scenarios have objects with gappy validity (Task 1 raised on
+  these), and the cost function sped the ego up. Both addressed on this
+  branch: gaps <= 1 s bridged, longer ones split into spans
+  (`build_agent_paths`); opt-in calibrated cost (`progress_along_heading`,
+  `w_ref_speed` in `compute_cost`).
+- **Selection fixes, now in `src/features.py`** (shared by extract.py and
+  closed_loop.py, resolving the duplication flagged in Part A): agents valid
+  at t within 50 m, nearest 32, history dropouts interpolated + a 7th
+  `observed` feature; map = all points within 80 m nearest-first (was the
+  first 200 in array order); `max_num_objects=128` (32 could cut the SDC).
+  The 7th feature means a retrain, and the old checkpoints need
+  `Stage1Model(agent_feat_dim=6)`.
+- **The Aug 22 retrain numbers below are not a fair comparison** (LR schedule
+  `T_max=5` over 10 epochs, test on the last epoch rather than the best
+  checkpoint, different setup from the pre-tau run).
+  `notebooks/Av2_retrain_meeting_prep.ipynb` retrains tau and t side by side
+  under identical conditions, plus a branch ablation.
+- The "flag, don't handle" instruction for gappy validity masks (Part B,
+  Task 1) is resolved by the above, decided with the repo owner.
+
 ## Status (as of 2026-08-29)
 
 This file was the working spec for the session that implemented everything
