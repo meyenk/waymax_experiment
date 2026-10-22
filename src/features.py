@@ -39,7 +39,7 @@ from src.transforms import transform_positions, transform_velocities, transform_
 AGENT_RADIUS = 50.0      # m, fixed for now (could be made speed-dependent later)
 MAX_AGENTS = 32
 MAP_RADIUS = 80.0        # m
-MAX_MAP_POINTS = 6000    # high on purpose: cover everything in the radius, don't subsample
+MAX_MAP_POINTS = 14000   # covers ~99% of instants within 80 m on WOMD val (p50 6.4k, p99 13.4k); don't subsample
 MAX_LIGHTS = 16
 AGENT_FEAT_DIM = 7       # [x, y, cos_yaw, sin_yaw, vx_rel, vy_rel, observed]
 
